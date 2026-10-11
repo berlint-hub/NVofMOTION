@@ -1,0 +1,78 @@
+name: build / GenericDepthEx (.addon64)
+
+# Samostatný x64 build externího depth addonu.
+# Nezávislé na ostatních workflow v repu (Switch/NetherSX2).
+# Buildí jen GenericDepthEx/generic_depth_ex.cpp -> generic_depth_ex.addon64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'GenericDepthEx/**'
+      - '.github/workflows/build-genericdepth.yml'
+  pull_request:
+    paths:
+      - 'GenericDepthEx/**'
+      - '.github/workflows/build-genericdepth.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-addon64:
+    name: GenericDepthEx · x64 Release
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout TEST
+        uses: actions/checkout@v4
+
+      - name: Checkout reshade headers (crosire/reshade)
+        uses: actions/checkout@v4
+        with:
+          repository: crosire/reshade
+          ref: main
+          path: reshade-main
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Verify inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "reshade-main/include/reshade.hpp")) { throw "missing reshade-main/include/reshade.hpp" }
+          if (-not (Test-Path "reshade-main/deps/imgui/imgui.h")) { throw "missing reshade-main/deps/imgui/imgui.h (submodules?)" }
+          if (-not (Test-Path "reshade-main/examples/09-depth/generic_depth_addon.cpp")) { throw "missing upstream generic_depth_addon.cpp" }
+          if (-not (Test-Path "GenericDepthEx/make_ex.py")) { throw "missing GenericDepthEx/make_ex.py" }
+          if (-not (Test-Path "GenericDepthEx/CMakeLists.txt")) { throw "missing GenericDepthEx/CMakeLists.txt" }
+
+      - name: Generate generic_depth_ex.cpp from upstream
+        shell: pwsh
+        run: python GenericDepthEx/make_ex.py --src reshade-main/examples/09-depth/generic_depth_addon.cpp --dst GenericDepthEx/generic_depth_ex.cpp
+
+      - name: Configure (x64)
+        shell: pwsh
+        run: cmake -S GenericDepthEx -B build -A x64 "-DRESHADE_ROOT=${{ github.workspace }}/reshade-main"
+
+      - name: Build Release
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect addon64
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $dll = Get-ChildItem -Recurse -Filter "generic_depth_ex.addon64" build | Select-Object -First 1
+          if ($null -eq $dll) {
+            Write-Host "=== build tree ==="
+            Get-ChildItem -Recurse build | Select-Object FullName | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+            throw "generic_depth_ex.addon64 not found after build"
+          }
+          Copy-Item $dll.FullName "out/generic_depth_ex.addon64" -Force
+          Get-Item "out/generic_depth_ex.addon64" | Format-Table Name, Length | Out-String -Width 120 | Write-Host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: generic_depth_ex-addon64
+          path: out/generic_depth_ex.addon64
+          if-no-files-found: error
