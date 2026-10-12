@@ -1,0 +1,78 @@
+name: build / NVOF Motion (.addon64)
+
+# Phase 1a: probe skeleton - ReShade headers only, no CUDA toolkit yet.
+# Builds NvofMotion/nvof_motion.cpp -> nvof_motion.addon64 (x64).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nvof-motion
+    paths:
+      - 'NvofMotion/**'
+      - '.github/workflows/build-nvof.yml'
+  pull_request:
+    branches:
+      - nvof-motion
+    paths:
+      - 'NvofMotion/**'
+      - '.github/workflows/build-nvof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-addon64:
+    name: NVOF Motion · x64 Release
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout TEST (branch nvof-motion)
+        uses: actions/checkout@v4
+        with:
+          ref: nvof-motion
+
+      - name: Checkout reshade headers (crosire/reshade)
+        uses: actions/checkout@v4
+        with:
+          repository: crosire/reshade
+          ref: main
+          path: reshade-main
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Verify inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "reshade-main/include/reshade.hpp")) { throw "missing reshade-main/include/reshade.hpp" }
+          if (-not (Test-Path "reshade-main/deps/imgui/imgui.h")) { throw "missing reshade-main/deps/imgui/imgui.h (submodules?)" }
+          if (-not (Test-Path "NvofMotion/nvof_motion.cpp")) { throw "missing NvofMotion/nvof_motion.cpp" }
+          if (-not (Test-Path "NvofMotion/CMakeLists.txt")) { throw "missing NvofMotion/CMakeLists.txt" }
+
+      - name: Configure (x64)
+        shell: pwsh
+        run: cmake -S NvofMotion -B build -A x64 "-DRESHADE_ROOT=${{ github.workspace }}/reshade-main"
+
+      - name: Build Release
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Collect addon64
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $dll = Get-ChildItem -Recurse -Filter "nvof_motion.addon64" build | Select-Object -First 1
+          if ($null -eq $dll) {
+            Write-Host "=== build tree ==="
+            Get-ChildItem -Recurse build | Select-Object FullName | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+            throw "nvof_motion.addon64 not found after build"
+          }
+          Copy-Item $dll.FullName "out/nvof_motion.addon64" -Force
+          Get-Item "out/nvof_motion.addon64" | Format-Table Name, Length | Out-String -Width 120 | Write-Host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvof_motion-addon64
+          path: out/nvof_motion.addon64
+          if-no-files-found: error
