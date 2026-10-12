@@ -1,17 +1,21 @@
-// NVOF Motion - phase 2a: frame capture + CUDA transport (no execute yet).
+// NVOF Motion - phase 2a: frame capture via CPU readback (no execute yet).
 //
 // Per frame (reshade_begin_effects, game thread), with OUR OWN native D3D12
 // command list (never touches ReShade's lists, no addon-event recursion):
 //  - backbuffer (pre-effects image, 1 frame old by design; TAA/history pairing)
-//    is copied into a ping-pong shared slot texture, signaled through our own
-//    fence; CUDA waits on the imported semaphore, then memcpys the slot into
-//    the NvOF input CUDA array. Fully async, zero CPU stalls, ordered by fence.
+//    is copied into a CPU-visible readback buffer, signaled through our own
+//    fence; completion is polled with zero timeout (never stalls - a busy
+//    frame is simply skipped and self-heals next frame), then the pixels are
+//    uploaded into the NvOF input CUDA array (HtoD) and checksummed (liveness
+//    proof in overlay).
 //  - NvOF session is built lazily at the real frame size on first frame and
 //    rebuilt on resize (drain via wait_idle first).
+// NOTE: readback roundtrip costs ~1-3 ms/frame; a zero-copy import replaces
+// it once the cuImportExternalMemory (CU 201) puzzle is solved (follow-up).
 //
 // Assumptions (validated at runtime, reported in overlay):
 //  - backbuffer is in PRESENT state at begin_effects (post-present invariant)
-//  - backbuffer format is R8G8B8A8 (slot format); otherwise idle with status
+//  - backbuffer format is R8G8B8A8; otherwise idle with status
 //  - NVOF input ABGR8 accepts our RGBA bytes (R/B swapped luma, v1 approx)
 //
 // Phase 2b will add: NvOFExecute, PTX int16->float convert, R16G16F output
@@ -49,15 +53,6 @@ using cuStreamCreate_fn = CUresult(CUDAAPI *)(CUstream *, unsigned int);
 using cuStreamDestroy_fn = CUresult(CUDAAPI *)(CUstream);
 using cuStreamSynchronize_fn = CUresult(CUDAAPI *)(CUstream);
 using cuMemcpy2DAsync_fn = CUresult(CUDAAPI *)(const CUDA_MEMCPY2D *, CUstream);
-using cuImportExternalMemory_fn = CUresult(CUDAAPI *)(CUexternalMemory *, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC *);
-using cuExternalMemoryGetMappedBuffer_fn =
-    CUresult(CUDAAPI *)(CUdeviceptr *, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC *);
-using cuDestroyExternalMemory_fn = CUresult(CUDAAPI *)(CUexternalMemory);
-using cuImportExternalSemaphore_fn =
-    CUresult(CUDAAPI *)(CUexternalSemaphore *, const CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC *);
-using cuDestroyExternalSemaphore_fn = CUresult(CUDAAPI *)(CUexternalSemaphore);
-using cuWaitExternalSemaphoresAsync_fn =
-    CUresult(CUDAAPI *)(const CUexternalSemaphore *, const CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS *, unsigned int, CUstream);
 
 using NvOFCreateInstance_fn =
     NV_OF_STATUS(NVOFAPI *)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *);
@@ -81,12 +76,6 @@ cuStreamCreate_fn p_cuStreamCreate = nullptr;
 cuStreamDestroy_fn p_cuStreamDestroy = nullptr;
 cuStreamSynchronize_fn p_cuStreamSynchronize = nullptr;
 cuMemcpy2DAsync_fn p_cuMemcpy2DAsync = nullptr;
-cuImportExternalMemory_fn p_cuImportExternalMemory = nullptr;
-cuExternalMemoryGetMappedBuffer_fn p_cuExternalMemoryGetMappedBuffer = nullptr;
-cuDestroyExternalMemory_fn p_cuDestroyExternalMemory = nullptr;
-cuImportExternalSemaphore_fn p_cuImportExternalSemaphore = nullptr;
-cuDestroyExternalSemaphore_fn p_cuDestroyExternalSemaphore = nullptr;
-cuWaitExternalSemaphoresAsync_fn p_cuWaitExternalSemaphoresAsync = nullptr;
 
 NvOFCreateInstance_fn p_NvOFCreateInstanceCuda = nullptr;
 NV_OF_CUDA_API_FUNCTION_LIST g_of = {};
@@ -104,19 +93,19 @@ std::string g_status = "not initialized yet";
 ID3D12CommandAllocator *g_cmd_alloc = nullptr;
 ID3D12GraphicsCommandList *g_cmd_list = nullptr;
 ID3D12Fence *g_fence = nullptr;
-HANDLE g_fence_handle = nullptr;
 uint64_t g_fence_value = 0;
-CUexternalSemaphore g_cuda_sem = nullptr;
+HANDLE g_frame_event = nullptr; // signaled when the copy of a frame is done
 CUstream g_stream = nullptr;
 
-struct CaptureSlot {
-    ID3D12Resource *tex = nullptr;
-    HANDLE shared_handle = nullptr;
-    CUexternalMemory ext_mem = nullptr;
-    CUdeviceptr mapped = 0;
-    uint32_t row_pitch = 0;
-};
-CaptureSlot g_slots[2] = {};
+// Single CPU-visible readback buffer + persistent mapping + copy footprint.
+ID3D12Resource *g_readback = nullptr;
+void *g_readback_ptr = nullptr;
+uint32_t g_readback_pitch = 0;
+size_t g_readback_size = 0;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_footprint = {};
+uint64_t g_last_checksum = 0;
+bool g_scene_active = false;
+uint64_t g_skips = 0;
 
 uint32_t g_frame_w = 0, g_frame_h = 0;
 
@@ -196,15 +185,6 @@ bool resolve_cuda_symbols_locked()
     NVOF_RESOLVE(p_cuStreamDestroy, cuStreamDestroy_fn, "cuStreamDestroy", nullptr);
     NVOF_RESOLVE(p_cuStreamSynchronize, cuStreamSynchronize_fn, "cuStreamSynchronize", nullptr);
     NVOF_RESOLVE(p_cuMemcpy2DAsync, cuMemcpy2DAsync_fn, "cuMemcpy2DAsync", "cuMemcpy2DAsync_v2");
-    NVOF_RESOLVE(p_cuImportExternalMemory, cuImportExternalMemory_fn, "cuImportExternalMemory", nullptr);
-    NVOF_RESOLVE(p_cuExternalMemoryGetMappedBuffer, cuExternalMemoryGetMappedBuffer_fn,
-                 "cuExternalMemoryGetMappedBuffer", nullptr);
-    NVOF_RESOLVE(p_cuDestroyExternalMemory, cuDestroyExternalMemory_fn, "cuDestroyExternalMemory", nullptr);
-    NVOF_RESOLVE(p_cuImportExternalSemaphore, cuImportExternalSemaphore_fn, "cuImportExternalSemaphore", nullptr);
-    NVOF_RESOLVE(p_cuDestroyExternalSemaphore, cuDestroyExternalSemaphore_fn, "cuDestroyExternalSemaphore",
-                 nullptr);
-    NVOF_RESOLVE(p_cuWaitExternalSemaphoresAsync, cuWaitExternalSemaphoresAsync_fn,
-                 "cuWaitExternalSemaphoresAsync", nullptr);
 #undef NVOF_RESOLVE
     return true;
 }
@@ -228,8 +208,8 @@ void destroy_of_locked()
     g_caps_ok = false;
 }
 
-// Drops capture slots + imports + session/inputs. Keeps ctx, table, DLLs and
-// size-independent objects (list/alloc/fence/sem/stream). Manages ctx itself.
+// Drops readback buffer + session/inputs. Keeps ctx, table, DLLs and
+// size-independent objects (list/alloc/fence/event/stream). Manages ctx itself.
 void teardown_pipeline_locked()
 {
     if (g_cu_ctx != nullptr && p_cuCtxSetCurrent != nullptr)
@@ -237,24 +217,16 @@ void teardown_pipeline_locked()
 
     destroy_of_locked();
 
-    for (int i = 0; i < 2; ++i)
+    if (g_readback != nullptr)
     {
-        if (g_slots[i].ext_mem != nullptr && p_cuDestroyExternalMemory != nullptr)
-            p_cuDestroyExternalMemory(g_slots[i].ext_mem);
-        g_slots[i].ext_mem = nullptr;
-        g_slots[i].mapped = 0;
-        g_slots[i].row_pitch = 0;
-        if (g_slots[i].shared_handle != nullptr)
-        {
-            CloseHandle(g_slots[i].shared_handle);
-            g_slots[i].shared_handle = nullptr;
-        }
-        if (g_slots[i].tex != nullptr)
-        {
-            g_slots[i].tex->Release();
-            g_slots[i].tex = nullptr;
-        }
+        const D3D12_RANGE written = { 0, 0 }; // CPU never writes
+        g_readback->Unmap(0, &written);
+        g_readback->Release();
+        g_readback = nullptr;
     }
+    g_readback_ptr = nullptr;
+    g_readback_pitch = 0;
+    g_readback_size = 0;
     g_frame_w = g_frame_h = 0;
 
     if (p_cuCtxSetCurrent != nullptr)
@@ -273,9 +245,6 @@ void teardown_all_locked()
     if (g_cu_ctx != nullptr && p_cuCtxSetCurrent != nullptr)
         p_cuCtxSetCurrent(g_cu_ctx);
 
-    if (g_cuda_sem != nullptr && p_cuDestroyExternalSemaphore != nullptr)
-        p_cuDestroyExternalSemaphore(g_cuda_sem);
-    g_cuda_sem = nullptr;
     if (g_stream != nullptr)
     {
         if (p_cuStreamSynchronize != nullptr)
@@ -299,10 +268,10 @@ void teardown_all_locked()
         g_fence->Release();
         g_fence = nullptr;
     }
-    if (g_fence_handle != nullptr)
+    if (g_frame_event != nullptr)
     {
-        CloseHandle(g_fence_handle);
-        g_fence_handle = nullptr;
+        CloseHandle(g_frame_event);
+        g_frame_event = nullptr;
     }
     g_fence_value = 0;
 
@@ -396,7 +365,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
     return true;
 }
 
-// (Re)builds the whole frame pipeline at W x H (slots + imports + session).
+// (Re)builds the whole frame pipeline at W x H (readback + session).
 // Caller must have drained the GPU first (wait_idle) when rebuilding.
 bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
@@ -422,121 +391,86 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         }
         if (g_fence == nullptr)
         {
-            if (FAILED(d3d12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_fence))))
+            if (FAILED(d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
             {
                 set_status_locked("CreateFence failed", reshade::log::level::warning);
                 break;
             }
-            if (FAILED(d3d12->CreateSharedHandle(g_fence, nullptr, GENERIC_ALL, nullptr, &g_fence_handle)) ||
-                g_fence_handle == nullptr)
+            g_frame_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (g_frame_event == nullptr)
             {
-                set_status_locked("CreateSharedHandle (fence) failed", reshade::log::level::warning);
+                set_status_locked("CreateEvent failed", reshade::log::level::warning);
                 break;
-            }
-            CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC sem_desc = {};
-            sem_desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
-            sem_desc.handle.win32.handle = g_fence_handle;
-            {
-                const CUresult src = p_cuImportExternalSemaphore(&g_cuda_sem, &sem_desc);
-                if (src != CUDA_SUCCESS || g_cuda_sem == nullptr)
-                {
-                    set_cu_status_locked("cuImportExternalSemaphore failed", src);
-                    break;
-                }
             }
         }
         if (g_stream == nullptr)
         {
-            const CUresult src = p_cuStreamCreate(&g_stream, 0);
-            if (src != CUDA_SUCCESS || g_stream == nullptr)
+            if (p_cuStreamCreate(&g_stream, 0) != CUDA_SUCCESS || g_stream == nullptr)
             {
-                set_cu_status_locked("cuStreamCreate failed", src);
+                set_cu_status_locked("cuStreamCreate failed", CUDA_SUCCESS);
                 break;
             }
         }
 
-        for (int i = 0; i < 2; ++i)
+        // Readback buffer for one frame (placed footprint of an RGBA8 image).
         {
-            D3D12_RESOURCE_DESC tex_desc = {};
-            tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-            tex_desc.Width = w;
-            tex_desc.Height = h;
-            tex_desc.DepthOrArraySize = 1;
-            tex_desc.MipLevels = 1;
-            tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            tex_desc.SampleDesc.Count = 1;
-            tex_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            tex_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            D3D12_RESOURCE_DESC img_desc = {};
+            img_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            img_desc.Width = w;
+            img_desc.Height = h;
+            img_desc.DepthOrArraySize = 1;
+            img_desc.MipLevels = 1;
+            img_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            img_desc.SampleDesc.Count = 1;
+            img_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+            UINT64 total_bytes = 0;
+            d3d12->GetCopyableFootprints(&img_desc, 0, 1, 0, &footprint, nullptr, nullptr, &total_bytes);
+            if (total_bytes == 0 || footprint.Footprint.RowPitch == 0)
+            {
+                set_status_locked("GetCopyableFootprints failed", reshade::log::level::warning);
+                break;
+            }
+
+            D3D12_RESOURCE_DESC buf_desc = {};
+            buf_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            buf_desc.Width = total_bytes;
+            buf_desc.Height = 1;
+            buf_desc.DepthOrArraySize = 1;
+            buf_desc.MipLevels = 1;
+            buf_desc.Format = DXGI_FORMAT_UNKNOWN;
+            buf_desc.SampleDesc.Count = 1;
+            buf_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
             D3D12_HEAP_PROPERTIES heap = {};
-            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            heap.Type = D3D12_HEAP_TYPE_READBACK;
             heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
             heap.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
 
-            ID3D12Resource *tex = nullptr;
-            if (FAILED(d3d12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &tex_desc,
+            ID3D12Resource *readback = nullptr;
+            if (FAILED(d3d12->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buf_desc,
                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                     IID_PPV_ARGS(&tex))) ||
-                tex == nullptr)
+                                                     IID_PPV_ARGS(&readback))) ||
+                readback == nullptr)
             {
-                set_status_locked("slot CreateCommittedResource failed", reshade::log::level::warning);
+                set_status_locked("readback CreateCommittedResource failed", reshade::log::level::warning);
                 break;
             }
-            HANDLE shared_handle = nullptr;
-            if (FAILED(d3d12->CreateSharedHandle(tex, nullptr, GENERIC_ALL, nullptr, &shared_handle)) ||
-                shared_handle == nullptr)
+            void *mapped_ptr = nullptr;
+            if (FAILED(readback->Map(0, nullptr, &mapped_ptr)) || mapped_ptr == nullptr)
             {
-                tex->Release();
-                set_status_locked("CreateSharedHandle (slot) failed", reshade::log::level::warning);
+                readback->Release();
+                set_status_locked("readback Map failed", reshade::log::level::warning);
                 break;
             }
-            const D3D12_RESOURCE_ALLOCATION_INFO alloc_info = d3d12->GetResourceAllocationInfo(0, 1, &tex_desc);
 
-            CUDA_EXTERNAL_MEMORY_HANDLE_DESC mem_desc = {};
-            mem_desc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
-            mem_desc.handle.win32.handle = shared_handle;
-            mem_desc.size = alloc_info.SizeInBytes;
-            // Committed D3D12 resources are dedicated allocations.
-            mem_desc.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
-
-            CUexternalMemory ext_mem = nullptr;
-            {
-                const CUresult imr = p_cuImportExternalMemory(&ext_mem, &mem_desc);
-                if (imr != CUDA_SUCCESS || ext_mem == nullptr)
-                {
-                    CloseHandle(shared_handle);
-                    tex->Release();
-                    set_cu_status_locked("cuImportExternalMemory failed", imr);
-                    break;
-                }
-            }
-            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-            d3d12->GetCopyableFootprints(&tex_desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
-
-            CUDA_EXTERNAL_MEMORY_BUFFER_DESC buf_desc = {};
-            buf_desc.offset = 0;
-            buf_desc.size = alloc_info.SizeInBytes;
-            CUdeviceptr mapped = 0;
-            {
-                const CUresult mmr = p_cuExternalMemoryGetMappedBuffer(&mapped, ext_mem, &buf_desc);
-                if (mmr != CUDA_SUCCESS || mapped == 0)
-                {
-                    p_cuDestroyExternalMemory(ext_mem);
-                    CloseHandle(shared_handle);
-                    tex->Release();
-                    set_cu_status_locked("cuExternalMemoryGetMappedBuffer failed", mmr);
-                    break;
-                }
-            }
-
-            g_slots[i].tex = tex;
-            g_slots[i].shared_handle = shared_handle;
-            g_slots[i].ext_mem = ext_mem;
-            g_slots[i].mapped = mapped;
-            g_slots[i].row_pitch = footprint.Footprint.RowPitch;
+            g_readback = readback;
+            g_readback_ptr = mapped_ptr;
+            g_readback_pitch = footprint.Footprint.RowPitch;
+            g_readback_size = static_cast<size_t>(total_bytes);
+            g_footprint = footprint;
         }
-        if (g_slots[0].tex == nullptr || g_slots[1].tex == nullptr)
-            break; // slot loop already reported
 
         if (!create_of_locked(w, h))
             break;
@@ -689,7 +623,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         return;
     if (bb_desc.texture.format != format::r8g8b8a8_unorm)
     {
-        if (g_session_active || g_slots[0].tex != nullptr)
+        if (g_session_active || g_readback != nullptr)
         {
             // Pipeline exists but format is unsupported: drop it, keep ctx
             // (teardown manages the context itself) for automatic recovery.
@@ -707,7 +641,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     if (native_queue == nullptr)
         return;
 
-    if (!g_session_active || g_slots[0].tex == nullptr || w != g_frame_w || h != g_frame_h)
+    if (!g_session_active || g_readback == nullptr || w != g_frame_w || h != g_frame_h)
     {
         // First frame or resize/format change: drain GPU, rebuild pipeline.
         // (teardown/build manage the CUDA context themselves.)
@@ -722,10 +656,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         set_status_locked("capture pipeline active", reshade::log::level::info);
     }
 
-    // ---- per-frame: copy bb -> slot, fence, CUDA wait + memcpy ----
-    const int slot = static_cast<int>(g_frames_captured % 2);
+    // ---- per-frame: copy bb -> readback, fence, poll, HtoD memcpy ----
     ID3D12Resource *bb_res = reinterpret_cast<ID3D12Resource *>(bb.handle);
-    ID3D12Resource *slot_res = g_slots[slot].tex;
 
     if (FAILED(g_cmd_alloc->Reset()) || FAILED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
     {
@@ -741,7 +673,17 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         g_cmd_list->ResourceBarrier(1, &to_copy);
     }
-    g_cmd_list->CopyResource(slot_res, bb_res);
+    {
+        D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+        dst_loc.pResource = g_readback;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst_loc.PlacedFootprint = g_footprint;
+        D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+        src_loc.pResource = bb_res;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0;
+        g_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+    }
     {
         D3D12_RESOURCE_BARRIER to_present = {};
         to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -760,24 +702,41 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     native_queue->ExecuteCommandLists(1, lists);
     native_queue->Signal(g_fence, ++g_fence_value);
 
+    // Non-blocking completion poll: if the copy is not done yet, skip this
+    // frame (vectors stay one frame older, self-heals next frame). Never stalls.
+    g_fence->SetEventOnCompletion(g_fence_value, g_frame_event);
+    if (WaitForSingleObject(g_frame_event, 0) != WAIT_OBJECT_0)
+    {
+        g_skips++;
+        return;
+    }
+
     if (p_cuCtxSetCurrent != nullptr)
         p_cuCtxSetCurrent(g_cu_ctx);
-    CUDA_EXTERNAL_SEMAPHORE_WAIT_PARAMS wait_params = {};
-    wait_params.params.fence.value = g_fence_value;
-    CUresult cu = p_cuWaitExternalSemaphoresAsync(&g_cuda_sem, &wait_params, 1, g_stream);
+    CUDA_MEMCPY2D m = {};
+    m.srcXInBytes = 0;
+    m.srcY = 0;
+    m.srcMemoryType = CU_MEMORYTYPE_HOST;
+    m.srcHost = g_readback_ptr;
+    m.srcPitch = g_readback_pitch;
+    m.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    m.dstArray = g_input_arrays[g_frames_captured % 2];
+    m.WidthInBytes = static_cast<size_t>(w) * 4;
+    m.Height = h;
+    CUresult cu = p_cuMemcpy2DAsync(&m, g_stream);
+    if (cu == CUDA_SUCCESS)
+        cu = p_cuStreamSynchronize(g_stream);
+    // Cheap liveness proof: sampled checksum of the captured pixels.
+    uint64_t sum = 0;
     if (cu == CUDA_SUCCESS)
     {
-        CUDA_MEMCPY2D m = {};
-        m.srcXInBytes = 0;
-        m.srcY = 0;
-        m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-        m.srcDevice = g_slots[slot].mapped;
-        m.srcPitch = g_slots[slot].row_pitch;
-        m.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-        m.dstArray = g_input_arrays[slot];
-        m.WidthInBytes = static_cast<size_t>(w) * 4;
-        m.Height = h;
-        cu = p_cuMemcpy2DAsync(&m, g_stream);
+        const uint8_t *base = static_cast<const uint8_t *>(g_readback_ptr);
+        for (uint32_t y = 0; y < h; y += 8)
+        {
+            const uint8_t *row = base + static_cast<size_t>(y) * g_readback_pitch;
+            for (uint32_t x = 0; x < w * 4; x += 64)
+                sum += row[x];
+        }
     }
     if (p_cuCtxSetCurrent != nullptr)
         p_cuCtxSetCurrent(nullptr);
@@ -788,6 +747,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         set_status_locked(cuda_error_text(cu).c_str(), reshade::log::level::warning);
         return;
     }
+    g_scene_active = (g_last_checksum != 0 && sum != g_last_checksum);
+    g_last_checksum = sum;
     g_frames_captured++;
     g_memcpys_done++;
 }
@@ -799,8 +760,9 @@ static void draw_overlay(effect_runtime *)
     bool session = false;
     bool caps_ok = false;
     uint32_t wmin = 0, wmax = 0, hmin = 0, hmax = 0, grids = 0;
-    uint64_t frames = 0, memcpys = 0;
+    uint64_t frames = 0, memcpys = 0, skips = 0;
     uint32_t fw = 0, fh = 0;
+    bool active = false;
     int last_cu = 0, last_of = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -817,6 +779,8 @@ static void draw_overlay(effect_runtime *)
         memcpys = g_memcpys_done;
         fw = g_frame_w;
         fh = g_frame_h;
+        skips = g_skips;
+        active = g_scene_active;
         last_cu = g_last_cu_code;
         last_of = g_last_of_code;
     }
@@ -841,7 +805,8 @@ static void draw_overlay(effect_runtime *)
     if (caps_ok)
         ImGui::Text("Caps: %ux%u .. %ux%u, out grids mask 0x%X", wmin, hmin, wmax, hmax, grids);
     if (fw != 0)
-        ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu", fw, fh, frames, memcpys);
+        ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu, skips %llu", fw, fh, frames, memcpys, skips);
+    ImGui::Text("Scene activity: %s", active ? "yes (pixels change)" : "no");
     ImGui::Text("Last codes: CU %d, OF %d", last_cu, last_of);
     ImGui::TextWrapped("%s", status.c_str());
 }
