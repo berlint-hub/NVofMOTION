@@ -1068,6 +1068,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         NV_OF_EXECUTE_INPUT_PARAMS in_params = {};
         in_params.inputFrame = g_input_bufs[1 - just_filled];
         in_params.referenceFrame = g_input_bufs[just_filled];
+        // Bisect temporal state: disabled (DALI/OpenCV default path).
+        in_params.disableTemporalHints = NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
         out_params.outputBuffer = g_out_buf;
         out_params.outputCostBuffer = nullptr; // enableOutputCost=FALSE (OpenCV-faithful)
@@ -1304,7 +1306,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali2]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali3]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
