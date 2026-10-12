@@ -40,7 +40,7 @@
 #include "nvOpticalFlowCuda.h"
 
 // NOTE: flow_ptx.h (convert kernel, built by CMake) is currently unused:
-// output is read as CUARRAY + converted on CPU. Kept for a future fast path.
+// output is read as CUDEVICEPTR + converted on CPU. Kept for a future fast path.
 
 using namespace reshade;
 using namespace reshade::api;
@@ -127,12 +127,15 @@ uint64_t g_skips = 0;
 
 uint32_t g_frame_w = 0, g_frame_h = 0;
 
+// OpenCV-faithful: CUDEVICEPTR buffers + driver stride (not CUarray).
 NvOFGPUBufferHandle g_input_bufs[2] = { nullptr, nullptr };
-CUarray g_input_arrays[2] = { nullptr, nullptr };
+CUdeviceptr g_input_ptrs[2] = { 0, 0 };
+uint32_t g_input_pitch[2] = { 0, 0 };
 
 // ---- phase 2b: execute output + conversion + exposure ----
 NvOFGPUBufferHandle g_out_buf = nullptr;
-CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
+CUdeviceptr g_out_ptr = 0; // SHORT2 flow vectors (S10.5) at grid size
+uint32_t g_out_pitch = 0;
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
 NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
 CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
@@ -278,12 +281,14 @@ void destroy_of_locked()
         if (g_input_bufs[i] != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
             g_of.nvOFDestroyGPUBufferCuda(g_input_bufs[i]);
         g_input_bufs[i] = nullptr;
-        g_input_arrays[i] = nullptr;
+        g_input_ptrs[i] = 0;
+        g_input_pitch[i] = 0;
     }
     if (g_out_buf != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
         g_of.nvOFDestroyGPUBufferCuda(g_out_buf);
     g_out_buf = nullptr;
-    g_out_array = nullptr;
+    g_out_ptr = 0;
+    g_out_pitch = 0;
     if (g_of_handle != nullptr && g_of.nvOFDestroy != nullptr)
     {
         g_of.nvOFDestroy(g_of_handle);
@@ -456,15 +461,25 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
             desc.height = h;
             desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
             desc.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
-            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_input_bufs[i]);
+            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                               &g_input_bufs[i]);
             if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
             {
                 g_last_of_code = static_cast<int>(st);
                 return false;
             }
-            g_input_arrays[i] = g_of.nvOFGPUBufferGetCUarray(g_input_bufs[i]);
-            if (g_input_arrays[i] == nullptr)
+            g_input_ptrs[i] = g_of.nvOFGPUBufferGetCUdeviceptr(g_input_bufs[i]);
+            if (g_input_ptrs[i] == 0)
                 return false;
+            // Driver pitch (OpenCV order); tight fallback.
+            g_input_pitch[i] = w * 4;
+            if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
+            {
+                NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
+                if (g_of.nvOFGPUBufferGetStrideInfo(g_input_bufs[i], &si) == NV_OF_SUCCESS &&
+                    si.strideInfo[0].strideXInBytes != 0)
+                    g_input_pitch[i] = si.strideInfo[0].strideXInBytes;
+            }
         }
         g_crash_stage = 5;
         NV_OF_BUFFER_DESCRIPTOR odesc = {};
@@ -472,15 +487,23 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         odesc.height = (h + 3) / 4;
         odesc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
         odesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
-        st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_out_buf);
+        st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &g_out_buf);
         if (st != NV_OF_SUCCESS || g_out_buf == nullptr)
         {
             g_last_of_code = static_cast<int>(st);
             return false;
         }
-        g_out_array = g_of.nvOFGPUBufferGetCUarray(g_out_buf);
-        if (g_out_array == nullptr)
+        g_out_ptr = g_of.nvOFGPUBufferGetCUdeviceptr(g_out_buf);
+        if (g_out_ptr == 0)
             return false;
+        g_out_pitch = ((w + 3) / 4) * sizeof(int16_t) * 2; // tight fallback
+        if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
+        {
+            NV_OF_CUDA_BUFFER_STRIDE_INFO osi = {};
+            if (g_of.nvOFGPUBufferGetStrideInfo(g_out_buf, &osi) == NV_OF_SUCCESS &&
+                osi.strideInfo[0].strideXInBytes != 0)
+                g_out_pitch = osi.strideInfo[0].strideXInBytes;
+        }
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -504,10 +527,13 @@ bool create_of_locked(uint32_t w, uint32_t h)
             g_of_handle = nullptr;
             g_input_bufs[0] = nullptr;
             g_input_bufs[1] = nullptr;
-            g_input_arrays[0] = nullptr;
-            g_input_arrays[1] = nullptr;
+            g_input_ptrs[0] = 0;
+            g_input_ptrs[1] = 0;
+            g_input_pitch[0] = 0;
+            g_input_pitch[1] = 0;
             g_out_buf = nullptr;
-            g_out_array = nullptr;
+            g_out_ptr = 0;
+            g_out_pitch = 0;
             char code[32] = {};
             snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned int>(g_last_of_code));
             const std::string msg = std::string("[NVOF Motion] DRIVER CRASH in bring-up (stage ") +
@@ -1036,8 +1062,9 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     m.srcMemoryType = CU_MEMORYTYPE_HOST;
     m.srcHost = g_readback_ptr;
     m.srcPitch = g_readback_pitch;
-    m.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-    m.dstArray = g_input_arrays[g_frames_captured % 2];
+    m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    m.dstDevice = g_input_ptrs[g_frames_captured % 2];
+    m.dstPitch = g_input_pitch[g_frames_captured % 2];
     m.WidthInBytes = static_cast<size_t>(w) * 4;
     m.Height = h;
     CUresult cu = p_cuMemcpy2DAsync(&m, g_stream);
@@ -1058,9 +1085,9 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
 
     // ---- NvOF execute on pair (prev, cur), convert on CPU, stats ----
     // Runs synchronously (execute blocks by API design); only when both
-    // input arrays hold a frame (from the 2nd captured frame on).
+    // input buffers hold a frame (from the 2nd captured frame on).
     bool have_vectors = false;
-    if (cu == CUDA_SUCCESS && g_frames_captured >= 1 && g_out_buf != nullptr && g_out_array != nullptr &&
+    if (cu == CUDA_SUCCESS && g_frames_captured >= 1 && g_out_buf != nullptr && g_out_ptr != 0 &&
         !g_of_cpu.empty())
     {
         const int just_filled = static_cast<int>(g_frames_captured % 2);
@@ -1099,8 +1126,9 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             g_exec_ok = true;
             // SHORT2 vectors -> host (int16 pairs); float convert happens on CPU.
             CUDA_MEMCPY2D d = {};
-            d.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-            d.srcArray = g_out_array;
+            d.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            d.srcDevice = g_out_ptr;
+            d.srcPitch = g_out_pitch;
             d.dstMemoryType = CU_MEMORYTYPE_HOST;
             d.dstHost = g_of_cpu.data();
             d.dstPitch = static_cast<size_t>(g_grid_w) * sizeof(int16_t) * 2;
@@ -1306,7 +1334,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali3]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali4]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))

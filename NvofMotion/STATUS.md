@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`, `[dali1]`, `[dali2]`, `[dali3]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`, `[dali1]`, `[dali2]`, `[dali3]`, `[dali4]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -67,13 +67,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   grid 4 confirmed). hintGrid theory ruled out.
 - Current test build `[dali2]` (still OF5, frames 3177): SetIO after init
   (OpenCV order) + zero-init + hintGrid UNDEFINED. SetIO order ruled out.
-- Current test build `[dali3]` = as `[dali2]` + `disableTemporalHints = TRUE`.
-  Rationale: DALI/OpenCV default path runs temporal-disabled; temporal-enabled
-  was never tested cleanly (earlier disable=TRUE builds were confounded by
-  ROI with enableRoi=0).
-- If `[dali3]` still OF5, next: CUDEVICEPTR input buffers + stride upload
-  (all proven code uses CUDEVICEPTR; our CUARRAY input path is untested on
-  Ada), then input/reference order, `apiVer`.
+- Current test build `[dali3]` (still OF5, frames 140): as `[dali2]` +
+  `disableTemporalHints = TRUE`. Temporal theory ruled out.
+- Current test build `[dali4]` = input+output buffers switched CUARRAY ->
+  CUDEVICEPTR with driver stride upload/download (OpenCV-faithful; ABGR8
+  kept). If this passes, the CUARRAY path was the INVALID_PARAM trigger.
+- If `[dali4]` still OF5, next: input/reference order swap, then `apiVer`.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
