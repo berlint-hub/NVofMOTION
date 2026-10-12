@@ -6,7 +6,17 @@ Nebuildí celý ReShade, jen `generic_depth_ex.addon64`.
 Rozšíření proti built-inu:
 - `Draw stats heuristic`: `Lowest vertices`, `Lowest draw calls`
 - `Filter by reversed depth`: `Any / Prefer reversed / Exclude reversed` (`[DEPTH] FilterReversed`)
+- `Aspect ratio heuristic`: `Match custom width and height range` – filtr min–max
+  pro width i height (`[DEPTH] FilterResolutionMinWidth/MaxWidth/MinHeight/MaxHeight`,
+  `0` = bez limitu na té straně)
 - prázdné staty vždy prohrávají (ochrana proti UI/mini bufferům)
+
+Tip pro PCSX2: když se šířka nemění a výška skáče, nastav
+`Aspect ratio heuristic = Match custom width and height range`,
+min/max width na tu stabilní šířku (nebo lehce kolem) a min/max height
+na rozsah, ve kterém se správný buffer pohybuje. Jakmile je kandidátů málo,
+přestane výběr skákat. Správný buffer jde případně i připnout natvrdo
+checkboxem v seznamu bufferů v overlayi.
 
 ## Použití
 
