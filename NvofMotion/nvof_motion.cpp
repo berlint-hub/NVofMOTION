@@ -405,9 +405,10 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         }
         if (g_stream == nullptr)
         {
-            if (p_cuStreamCreate(&g_stream, 0) != CUDA_SUCCESS || g_stream == nullptr)
+            const CUresult src = p_cuStreamCreate(&g_stream, 0);
+            if (src != CUDA_SUCCESS || g_stream == nullptr)
             {
-                set_cu_status_locked("cuStreamCreate failed", CUDA_SUCCESS);
+                set_cu_status_locked("cuStreamCreate failed", src);
                 break;
             }
         }
