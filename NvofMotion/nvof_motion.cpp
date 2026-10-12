@@ -882,6 +882,40 @@ static void on_destroy_device(device *device)
         teardown_all_locked();
         g_status.assign("torn down (device destroyed)");
     }
+}
+
+static void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
+{
+    if (g_enabled == 0)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_cu_ctx == nullptr || g_owner_device == nullptr)
+        return; // init_device did not complete (or non-D3D12)
+
+    device *dev = runtime->get_device();
+    ID3D12Device *d3d12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
+    if (d3d12 == nullptr || d3d12 != g_owner_device)
+        return;
+    const resource bb = runtime->get_current_back_buffer();
+    if (bb.handle == 0)
+        return;
+    const resource_desc bb_desc = dev->get_resource_desc(bb);
+    if (bb_desc.type != resource_type::texture_2d || bb_desc.texture.width == 0 || bb_desc.texture.height == 0)
+        return;
+    if (bb_desc.texture.format != format::r8g8b8a8_unorm)
+    {
+        if (g_session_active || g_readback != nullptr)
+        {
+            // Pipeline exists but format is unsupported: drop it, keep ctx
+            // (teardown manages the context itself) for automatic recovery.
+            teardown_pipeline_locked(false); // no drain here: leak cb texture
+            set_status_locked("unsupported backbuffer format (need R8G8B8A8), idle", reshade::log::level::warning);
+        }
+        return;
+    }
+    const uint32_t w = bb_desc.texture.width;
+    const uint32_t h = bb_desc.texture.height;
 
     command_queue *queue = runtime->get_command_queue();
     ID3D12CommandQueue *native_queue =
