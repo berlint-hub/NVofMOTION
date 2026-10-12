@@ -134,6 +134,7 @@ CUarray g_input_arrays[2] = { nullptr, nullptr };
 NvOFGPUBufferHandle g_out_buf = nullptr;
 CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
+NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
 CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
 CUfunction g_convert_fn = nullptr; // (teardown stays null-safe)
 uint32_t g_grid_w = 0, g_grid_h = 0;
@@ -1240,7 +1241,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors)");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [roi1]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
