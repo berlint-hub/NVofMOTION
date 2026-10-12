@@ -5,9 +5,9 @@ fixed-function optical-flow engine (NVOFA, Turing+) for games/emulators
 that do not provide their own (e.g. PCSX2). No ReShade recompile needed,
 just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
-> Status: **phase 2a (frame capture + CUDA transport, no execute yet)** –
-> backbuffer is copied into shared slot textures with our own native D3D12
-> list, fenced, and moved into NvOF input arrays. Overlay shows counters.
+> Status: **phase 2b (vectors)** – per-frame `NvOFExecute`, PTX int16->float
+> convert, R16G16F output texture + `MotionVectors` binding / configurable
+> `TargetTexture` injection, flow stats in overlay.
 
 ## Roadmap
 
@@ -15,11 +15,21 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
   `NvOFAPICreateInstanceCuda`, status reporting. No CUDA toolkit needed.
 - **1b (done):** CUDA context (LUID-matched to the game adapter), NvOF
   session create/init, `nvOFGetCaps` in the overlay.
-- **2a (this):** lazy session at real frame size + rebuild on resize, own
-  native command list + fence -> CUDA semaphore, per-frame copy + memcpy
-  into NvOF input arrays, overlay counters.
-- **2b:** `NvOFExecute`, PTX int16->float convert, R16G16F output +
-  `MotionVectors` binding / configurable `TargetTexture` injection, preview.
+- **2a (done):** lazy session at real frame size + rebuild on resize, own
+  native command list + fence, readback capture + HtoD into NvOF inputs,
+  checksum liveness proof in overlay.
+- **2b (this):** `NvOFExecute`, PTX int16->float convert, R16G16F output +
+  `MotionVectors` binding / configurable `TargetTexture` injection, stats.
+
+## Shader interface
+
+- **Binding:** `texture MotionTex < source = "MotionVectors"; >` gives the
+  R16G16F flow field (grid 4 → texture is W/4 x H/4, values in pixels).
+- **Injection:** `[NVOF] TargetTexture=<name>` (default `motion_vectors_tex`,
+  empty = off) copies the field into that effect texture variable every frame
+  (must exist as R16G16F at grid size, e.g. PPOM-style `pooled=false`).
+- **Scale:** S10.5 hardware units -> px, `[NVOF] FlowScale` (default 1/32),
+  tunable in overlay. Vectors lag ~2 frames by design (history pairing).
 
 ## Requirements
 
@@ -45,5 +55,6 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 Workflow `.github/workflows/build-nvof.yml` (`windows-2022`, x64 Release):
 - checkout `crosire/reshade` into `reshade-main` (headers + `deps/imgui`)
 - checkout `NVIDIA/NVIDIAOpticalFlowSDK` into `nvof-sdk` (BSD headers)
-- install the CUDA toolkit (for `cuda.h`; types only, nothing linked)
-- CMake + upload artifact `nvof_motion.addon64`
+- install the CUDA toolkit (for `cuda.h` + `nvcc`; types and PTX only,
+  nothing linked)
+- CMake (PTX kernel -> embedded header) + upload artifact `nvof_motion.addon64`

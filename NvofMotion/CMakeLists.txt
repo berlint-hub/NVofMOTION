@@ -11,8 +11,9 @@ set(RESHADE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../reshade-main" CACHE PATH
 # nvOpticalFlowCuda.h at its root). Phase 1b+ requires it.
 set(NVOF_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../nvof-sdk" CACHE PATH
     "Root of the NVIDIAOpticalFlowSDK checkout")
-# Root of an installed CUDA toolkit (provides cuda.h; types only -
-# the add-on binds nvcuda.dll explicitly at runtime, no cuda.lib linkage).
+# Root of an installed CUDA toolkit (provides cuda.h for types and nvcc for
+# the PTX kernel - the add-on binds nvcuda.dll explicitly at runtime,
+# no cuda.lib linkage).
 set(CUDA_TOOLKIT_ROOT "$ENV{CUDA_PATH}" CACHE PATH
     "CUDA toolkit root (cuda.h lives in <root>/include)")
 
@@ -35,16 +36,52 @@ if(NOT EXISTS "${CUDA_TOOLKIT_ROOT}/include/cuda.h")
         "  Current CUDA_TOOLKIT_ROOT = ${CUDA_TOOLKIT_ROOT}")
 endif()
 
+# ── PTX kernel (flow_convert.cu -> flow_ptx.h) ──────────────────────────────
+find_program(NVCC_EXECUTABLE nvcc
+    HINTS "${CUDA_TOOLKIT_ROOT}/bin"
+    NO_DEFAULT_PATH)
+if(NOT NVCC_EXECUTABLE)
+    find_program(NVCC_EXECUTABLE nvcc)
+endif()
+if(NOT NVCC_EXECUTABLE)
+    message(FATAL_ERROR "nvcc not found – needed to compile flow_convert.cu to PTX.")
+endif()
+
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
+    COMMAND "${NVCC_EXECUTABLE}" -ptx
+            "${CMAKE_CURRENT_SOURCE_DIR}/flow_convert.cu"
+            -o "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/flow_convert.cu"
+    COMMENT "Compiling flow_convert.cu to PTX"
+    VERBATIM)
+
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h"
+    COMMAND "${CMAKE_COMMAND}"
+            "-DPTX=${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
+            "-DHEADER=${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_ptx.cmake"
+    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
+            "${CMAKE_CURRENT_SOURCE_DIR}/embed_ptx.cmake"
+    COMMENT "Embedding flow PTX into header"
+    VERBATIM)
+
+add_custom_target(flow_ptx_header DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h")
+
 # ── Target ──────────────────────────────────────────────────────────────────
 add_library(nvof_motion SHARED
     nvof_motion.cpp
 )
+
+add_dependencies(nvof_motion flow_ptx_header)
 
 target_include_directories(nvof_motion PRIVATE
     ${RESHADE_INCLUDE}
     ${IMGUI_INCLUDE}
     ${NVOF_SDK}
     ${CUDA_TOOLKIT_ROOT}/include
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_compile_definitions(nvof_motion PRIVATE
