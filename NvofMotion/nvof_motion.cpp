@@ -134,6 +134,7 @@ CUarray g_input_arrays[2] = { nullptr, nullptr };
 NvOFGPUBufferHandle g_out_buf = nullptr;
 CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
+NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
 CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
 CUfunction g_convert_fn = nullptr; // (teardown stays null-safe)
 uint32_t g_grid_w = 0, g_grid_h = 0;
@@ -752,6 +753,10 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
 
         g_frame_w = w;
         g_frame_h = h;
+        g_roi.start_x = 0;
+        g_roi.start_y = 0;
+        g_roi.width = (w / 128) * 128;
+        g_roi.height = (h / 32) * 32;
         ok = true;
     } while (false);
 
@@ -852,7 +857,7 @@ static void on_init_device(device *device)
             g_of.nvOFGetCaps == nullptr || g_of.nvOFDestroy == nullptr ||
             g_of.nvOFCreateGPUBufferCuda == nullptr || g_of.nvOFGPUBufferGetCUarray == nullptr ||
             g_of.nvOFDestroyGPUBufferCuda == nullptr || g_of.nvOFExecute == nullptr ||
-            g_of.nvOFGPUBufferGetCUdeviceptr == nullptr)
+            g_of.nvOFGPUBufferGetCUdeviceptr == nullptr || g_of.nvOFSetIOCudaStreams == nullptr)
         {
             g_last_of_code = static_cast<int>(st);
             set_status_locked("NvOFAPICreateInstanceCuda failed or incomplete", reshade::log::level::warning);
@@ -877,40 +882,6 @@ static void on_destroy_device(device *device)
         teardown_all_locked();
         g_status.assign("torn down (device destroyed)");
     }
-}
-
-static void on_begin_effects(effect_runtime *runtime, command_list *, resource_view, resource_view)
-{
-    if (g_enabled == 0)
-        return;
-
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_cu_ctx == nullptr || g_owner_device == nullptr)
-        return; // init_device did not complete (or non-D3D12)
-
-    device *dev = runtime->get_device();
-    ID3D12Device *d3d12 = reinterpret_cast<ID3D12Device *>(dev->get_native());
-    if (d3d12 == nullptr || d3d12 != g_owner_device)
-        return;
-    const resource bb = runtime->get_current_back_buffer();
-    if (bb.handle == 0)
-        return;
-    const resource_desc bb_desc = dev->get_resource_desc(bb);
-    if (bb_desc.type != resource_type::texture_2d || bb_desc.texture.width == 0 || bb_desc.texture.height == 0)
-        return;
-    if (bb_desc.texture.format != format::r8g8b8a8_unorm)
-    {
-        if (g_session_active || g_readback != nullptr)
-        {
-            // Pipeline exists but format is unsupported: drop it, keep ctx
-            // (teardown manages the context itself) for automatic recovery.
-            teardown_pipeline_locked(false); // no drain here: leak cb texture
-            set_status_locked("unsupported backbuffer format (need R8G8B8A8), idle", reshade::log::level::warning);
-        }
-        return;
-    }
-    const uint32_t w = bb_desc.texture.width;
-    const uint32_t h = bb_desc.texture.height;
 
     command_queue *queue = runtime->get_command_queue();
     ID3D12CommandQueue *native_queue =
