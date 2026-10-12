@@ -5,26 +5,28 @@ fixed-function optical-flow engine (NVOFA, Turing+) for games/emulators
 that do not provide their own (e.g. PCSX2). No ReShade recompile needed,
 just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
-> Status: **phase 1b (CUDA context + NvOF session + caps)** – validates driver
-> API, device matching, session bring-up and capability query. Still no frame
-> processing (phase 2).
+> Status: **phase 2a (frame capture + CUDA transport, no execute yet)** –
+> backbuffer is copied into shared slot textures with our own native D3D12
+> list, fenced, and moved into NvOF input arrays. Overlay shows counters.
 
 ## Roadmap
 
 - **1a (done):** build + load + overlay + probe `nvofapi64.dll` /
   `NvOFAPICreateInstanceCuda`, status reporting. No CUDA toolkit needed.
-- **1b (this):** CUDA context (LUID-matched to the game adapter), NvOF
-  session create/init (1280x720 placeholder, grid 4, fast), `nvOFGetCaps`
-  (W/H min/max, supported output grid sizes) in the overlay.
-- **2:** frame capture (own shared D3D12 textures) -> `NvOFExecute` on a
-  worker thread -> R16G16F motion-vector texture exposed to shaders
-  (PPOM-style `MotionInput` injection), overlay preview.
+- **1b (done):** CUDA context (LUID-matched to the game adapter), NvOF
+  session create/init, `nvOFGetCaps` in the overlay.
+- **2a (this):** lazy session at real frame size + rebuild on resize, own
+  native command list + fence -> CUDA semaphore, per-frame copy + memcpy
+  into NvOF input arrays, overlay counters.
+- **2b:** `NvOFExecute`, PTX int16->float convert, R16G16F output +
+  `MotionVectors` binding / configurable `TargetTexture` injection, preview.
 
 ## Requirements
 
 - Windows x64, D3D12 game (v1 supports D3D12 only, silent elsewhere)
 - NVIDIA Turing+ GPU + driver with NvOF (driver 445.87+; ships `nvofapi64.dll`
   and `nvcuda.dll`; both bound explicitly at runtime, no .lib linkage)
+- Backbuffer R8G8B8A8 (otherwise idle with status)
 - On AMD/Intel or without those DLLs the add-on stays idle (see overlay)
 
 ## Install & config
