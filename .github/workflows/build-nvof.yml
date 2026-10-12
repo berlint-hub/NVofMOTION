@@ -51,10 +51,10 @@ jobs:
           fetch-depth: 1
 
       - name: Install CUDA toolkit (headers only; nothing linked)
-        uses: Jimver/cuda-toolkit@v0.2.11
+        uses: Jimver/cuda-toolkit@v0.2.36
         id: cuda-toolkit
         with:
-          cuda: '12.6'
+          cuda: '12.6.0'
           method: 'network'
 
       - name: Debug CUDA install
