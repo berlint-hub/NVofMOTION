@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`, `[dali1]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`, `[dali1]`, `[dali2]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -61,12 +61,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
   with external hints OFF they set `hintGridSize = UNDEFINED`, we set 4.
   Also they set `outputCostBuffer = nullptr` explicitly, output dims ceil,
   caps two-stage, and `nvOFGetLastError` for detail (we never called it).
-- Current test build `[dali1]` = SetIO kept + zero-init execute +
-  `hintGridSize = UNDEFINED` + `GetLastError` in overlay/log + real
-  grids/ROI caps + ceil output dims. If this passes, hintGrid was it.
-- If `[dali1]` still OF5, next: SetIO after init (OpenCV order) instead of
-  before, then ABGR8/CUARRAY input vs GRAYSCALE8/CUDEVICEPTR, then
-  input/reference order, `apiVer` staleness.
+- Current test build `[dali1]` (still OF5, frames 901): SetIO before init +
+  zero-init + `hintGridSize = UNDEFINED` + `GetLastError` (= generic
+  `Internal execution status`) + real caps (`Grids: 1 2 4 | ROI support: 1`,
+  grid 4 confirmed). hintGrid theory ruled out.
+- Current test build `[dali2]` = SetIO moved AFTER init (OpenCV order:
+  create -> init -> SetIO -> buffers). Header doc only requires SetIO
+  before Execute; init may reset the preset streams.
+- If `[dali2]` still OF5, next: ABGR8/CUARRAY input vs GRAYSCALE8/CUDEVICEPTR
+  (OpenCV uses CUDEVICEPTR + stride), then input/reference order, `apiVer`.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

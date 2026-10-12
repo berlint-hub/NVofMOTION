@@ -420,12 +420,6 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         g_of_handle = hOf;
 
         g_crash_stage = 2;
-        NV_OF_STATUS sts = g_of.nvOFSetIOCudaStreams(hOf, g_stream, g_stream);
-        if (sts != NV_OF_SUCCESS)
-        {
-            g_last_of_code = static_cast<int>(sts);
-            return false;
-        }
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
@@ -440,6 +434,14 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         init.hPrivData = nullptr;
 
         st = g_of.nvOFInit(hOf, &init);
+        if (st != NV_OF_SUCCESS)
+        {
+            g_last_of_code = static_cast<int>(st);
+            return false;
+        }
+
+        // OpenCV order: SetIO AFTER init (header doc: call before Execute).
+        st = g_of.nvOFSetIOCudaStreams(hOf, g_stream, g_stream);
         if (st != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(st);
@@ -1302,7 +1304,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali1]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali2]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
