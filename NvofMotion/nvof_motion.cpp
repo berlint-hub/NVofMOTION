@@ -299,7 +299,6 @@ void teardown_pipeline_locked(bool gpu_idle)
 
     g_of_cpu.clear();
     g_of_cpu.shrink_to_fit();
-
     if (g_readback != nullptr)
     {
         const D3D12_RANGE written = { 0, 0 }; // CPU never writes
@@ -538,7 +537,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
 
 // (Re)builds the whole frame pipeline at W x H (readback + session).
 // Caller must have drained the GPU first (wait_idle) when rebuilding.
-bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
+bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
     if (p_cuCtxSetCurrent == nullptr || g_cu_ctx == nullptr)
         return false;
@@ -915,7 +914,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     {
         // First frame or resize/format change: rebuild pipeline.
         // Drain the GPU only when live objects exist (first build has nothing
-        // in flight; wait_idle on a fresh device risks stall/deadlock).
+        // in flight; wait_idle on a fresh device Henriks stall/deadlock).
         // (teardown/build manage the CUDA context themselves.)
         if (g_session_active || g_readback != nullptr)
             queue->wait_idle();
@@ -1038,6 +1037,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         else
         {
             g_exec_ok = true;
+            // SHORT2 vectors -> host (int16 pairs); float convert happens on CPU.
             CUDA_MEMCPY2D d = {};
             d.srcMemoryType = CU_MEMORYTYPE_ARRAY;
             d.srcArray = g_out_array;
@@ -1239,8 +1239,7 @@ static void draw_overlay(effect_runtime *)
 
     ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors)");
 
-    bool enabled = get_enabled_cached();
-    if (false) {}
+    bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
     {
         g_enabled = enabled ? 1u : 0u;
