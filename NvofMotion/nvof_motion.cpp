@@ -398,7 +398,7 @@ void teardown_all_locked()
 
 // POD-only NvOF bring-up with SEH guard: any driver crash inside becomes a
 // reported status (stage + exception code) instead of a dead process.
-// Stages: 1 = create handle, 2 = init, 3/4 = input buffers.
+// Stages: 1 = create handle, 2 = init, 3/4 = input buffers, 5 = output.
 // Returns false on error or exception. On exception, handles are deliberately
 // leaked (never touch the driver again on that path); g_crashed_nvof is set.
 // NOTE: no unwindable locals in here (C2712) - POD and globals only.
@@ -555,7 +555,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
 
 // (Re)builds the whole frame pipeline at W x H (readback + session).
 // Caller must have drained the GPU first (wait_idle) when rebuilding.
-bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_t h)
+bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
     if (p_cuCtxSetCurrent == nullptr || g_cu_ctx == nullptr)
         return false;
@@ -1071,7 +1071,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         else
         {
             g_exec_ok = true;
-            const int nitems = static_cast<int>(g_grid_w) * static_cast<int>(g_grid_h);
+            int nitems = static_cast<int>(g_grid_w) * static_cast<int>(g_grid_h);
             float scale = g_flow_scale;
             void *kargs[] = { &g_out_raw, &g_flow_linear, &nitems, &scale };
             cu = p_cuLaunchKernel(g_convert_fn, (static_cast<unsigned int>(nitems) + 255) / 256, 1, 1, 256,
