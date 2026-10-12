@@ -555,7 +555,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
 
 // (Re)builds the whole frame pipeline at W x H (readback + session).
 // Caller must have drained the GPU first (wait_idle) when rebuilding.
-bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
+bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
     if (p_cuCtxSetCurrent == nullptr || g_cu_ctx == nullptr)
         return false;
