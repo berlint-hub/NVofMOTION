@@ -48,7 +48,7 @@ using cuGetErrorString_fn = CUresult(CUDAAPI *)(CUresult, const char **);
 using cuStreamCreate_fn = CUresult(CUDAAPI *)(CUstream *, unsigned int);
 using cuStreamDestroy_fn = CUresult(CUDAAPI *)(CUstream);
 using cuStreamSynchronize_fn = CUresult(CUDAAPI *)(CUstream);
-using cuMemcpy2DAsync_fn = CUresult(CUDAAPI *)(const CUDA_MEMCPY2D *);
+using cuMemcpy2DAsync_fn = CUresult(CUDAAPI *)(const CUDA_MEMCPY2D *, CUstream);
 using cuImportExternalMemory_fn = CUresult(CUDAAPI *)(CUexternalMemory *, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC *);
 using cuExternalMemoryGetMappedBuffer_fn =
     CUresult(CUDAAPI *)(CUdeviceptr *, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC *);
