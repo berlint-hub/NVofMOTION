@@ -1024,6 +1024,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         NV_OF_EXECUTE_INPUT_PARAMS in_params = {};
         in_params.inputFrame = g_input_bufs[1 - just_filled];
         in_params.referenceFrame = g_input_bufs[just_filled];
+        in_params.disableTemporalHints = NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
         out_params.outputBuffer = g_out_buf;
         const NV_OF_STATUS ost = g_of.nvOFExecute(g_of_handle, &in_params, &out_params);
