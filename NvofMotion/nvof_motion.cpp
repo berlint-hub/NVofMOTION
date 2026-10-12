@@ -361,6 +361,12 @@ bool create_of_locked(uint32_t w, uint32_t h)
         }
     }
 
+    {
+        const std::string msg =
+            "[NVOF Motion] session init ok (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+        reshade::log::message(reshade::log::level::info, msg.c_str());
+    }
+
     g_session_active = true;
     return true;
 }
@@ -375,6 +381,10 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 
     // On any failure below, the caller runs teardown_pipeline_locked(),
     // which safely drops partial state.
+    // NvOF session + input dims are aligned up (HW grid friendliness);
+    // readback + memcpy stay at the real frame size (subregion copy).
+    const uint32_t sw = (w + 7u) & ~7u;
+    const uint32_t sh = (h + 7u) & ~7u;
     bool ok = false;
     do // single-pass for linear error handling
     {
@@ -389,6 +399,7 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
                 break;
             }
         }
+        reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: cmd list ok");
         if (g_fence == nullptr)
         {
             if (FAILED(d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence))))
@@ -403,6 +414,7 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
                 break;
             }
         }
+        reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: fence+event ok");
         if (g_stream == nullptr)
         {
             const CUresult src = p_cuStreamCreate(&g_stream, 0);
@@ -412,7 +424,7 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
                 break;
             }
         }
-
+        reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: stream ok");
         // Readback buffer for one frame (placed footprint of an RGBA8 image).
         {
             D3D12_RESOURCE_DESC img_desc = {};
@@ -473,7 +485,8 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
             g_footprint = footprint;
         }
 
-        if (!create_of_locked(w, h))
+        reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: readback ok");
+        if (!create_of_locked(sw, sh))
             break;
 
         g_frame_w = w;
@@ -644,9 +657,12 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
 
     if (!g_session_active || g_readback == nullptr || w != g_frame_w || h != g_frame_h)
     {
-        // First frame or resize/format change: drain GPU, rebuild pipeline.
+        // First frame or resize/format change: rebuild pipeline.
+        // Drain the GPU only when live objects exist (first build has nothing
+        // in flight; wait_idle on a fresh device risks stall/deadlock).
         // (teardown/build manage the CUDA context themselves.)
-        queue->wait_idle();
+        if (g_session_active || g_readback != nullptr)
+            queue->wait_idle();
         teardown_pipeline_locked();
         const bool built = build_pipeline_locked(d3d12, w, h);
         if (!built)
