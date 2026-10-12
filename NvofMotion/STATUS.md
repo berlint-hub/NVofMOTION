@@ -48,20 +48,25 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`, `[dali1]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
 - Ruled out, in order: CUDEVICEPTR output (CUARRAY still OF5), temporal
   hints off (still OF5), numRois=1 + legal ROI (still OF5, `[roi1]` build),
   SetIO + ROI + hints-off together (still OF5, `[streams]` build 12.10.2026:
-  3440x1440, frames 648, executes 0, CU 0 / OF 5).
-- Current test build `[dali0]` = SetIO kept + DALI-faithful zero-init
-  execute params (no ROI, no hints flags). If this passes, ROI/hints were
-  the INVALID_PARAM trigger.
-- If `[dali0]` still OF5, next theories: ABGR8 input at execute time,
-  input/reference order, `apiVer` staleness, DALI deeper dive
-  (external hints handling).
+  3440x1440, frames 648, executes 0, CU 0 / OF 5), SetIO + zero-init
+  (still OF5, `[dali0]` build: frames 3411, executes 0, CU 0 / OF 5).
+- FOUND vs OpenCV production code (`opencv_contrib`, same 2.0 headers):
+  with external hints OFF they set `hintGridSize = UNDEFINED`, we set 4.
+  Also they set `outputCostBuffer = nullptr` explicitly, output dims ceil,
+  caps two-stage, and `nvOFGetLastError` for detail (we never called it).
+- Current test build `[dali1]` = SetIO kept + zero-init execute +
+  `hintGridSize = UNDEFINED` + `GetLastError` in overlay/log + real
+  grids/ROI caps + ceil output dims. If this passes, hintGrid was it.
+- If `[dali1]` still OF5, next: SetIO after init (OpenCV order) instead of
+  before, then ABGR8/CUARRAY input vs GRAYSCALE8/CUDEVICEPTR, then
+  input/reference order, `apiVer` staleness.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

@@ -159,6 +159,7 @@ uint64_t g_frames_captured = 0;
 uint64_t g_memcpys_done = 0;
 int g_last_cu_code = 0;
 int g_last_of_code = 0;
+std::string g_last_of_error; // nvOFGetLastError text for the last execute failure
 // SEH forensics: which bring-up stage crashed + exception code (0 = no crash).
 int g_crash_stage = 0;
 bool g_crashed_nvof = false;
@@ -166,6 +167,9 @@ bool g_crashed_nvof = false;
 // cached caps for the overlay (no CUDA calls from overlay thread)
 uint32_t g_cap_wmin = 0, g_cap_wmax = 0, g_cap_hmin = 0, g_cap_hmax = 0;
 uint32_t g_cap_grids = 0;
+uint32_t g_cap_grids_list[8] = {};
+uint32_t g_cap_grids_count = 0;
+uint32_t g_cap_roi = 0;
 bool g_caps_ok = false;
 
 void set_status_locked(const char *text, reshade::log::level level)
@@ -426,7 +430,9 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         init.width = w;
         init.height = h;
         init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
-        init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_4;
+        // OpenCV-faithful: hintGridSize UNDEFINED when external hints off
+        // (spec: field only considered when enableExternalHints set).
+        init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
         init.perfLevel = NV_OF_PERF_LEVEL_FAST;
         init.enableExternalHints = NV_OF_FALSE;
@@ -460,8 +466,8 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         }
         g_crash_stage = 5;
         NV_OF_BUFFER_DESCRIPTOR odesc = {};
-        odesc.width = w / 4;
-        odesc.height = h / 4;
+        odesc.width = (w + 3) / 4; // ceil (OpenCV order)
+        odesc.height = (h + 3) / 4;
         odesc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
         odesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
         st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_out_buf);
@@ -528,10 +534,32 @@ bool create_of_locked(uint32_t w, uint32_t h)
         query_cap(NV_OF_CAPS_HEIGHT_MIN, g_cap_hmin) &
         query_cap(NV_OF_CAPS_HEIGHT_MAX, g_cap_hmax);
     query_cap(NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, g_cap_grids);
+    // Two-stage caps (OpenCV order): real supported-grids array + ROI support.
+    if (g_of.nvOFGetCaps != nullptr)
+    {
+        uint32_t n = 0;
+        if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, nullptr, &n) ==
+                NV_OF_SUCCESS &&
+            n > 0 && n <= 8)
+        {
+            uint32_t vals[8] = {};
+            uint32_t m = n;
+            if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, vals, &m) ==
+                NV_OF_SUCCESS)
+            {
+                g_cap_grids_count = (m <= 8) ? m : 8;
+                for (uint32_t i = 0; i < g_cap_grids_count; ++i)
+                    g_cap_grids_list[i] = vals[i];
+            }
+        }
+        uint32_t roi = 0, rsz = sizeof(roi);
+        if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORT_ROI, &roi, &rsz) == NV_OF_SUCCESS)
+            g_cap_roi = roi;
+    }
 
-    // int16 pairs staging for the array->host download.
-    g_grid_w = w / 4;
-    g_grid_h = h / 4;
+    // int16 pairs staging for the array->host download (ceil, OpenCV order).
+    g_grid_w = (w + 3) / 4;
+    g_grid_h = (h + 3) / 4;
     g_of_cpu.assign(static_cast<size_t>(g_grid_w) * g_grid_h * 2, 0);
 
     {
@@ -540,6 +568,8 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
     }
 
+    g_last_of_error.clear();
+    g_exec_ok = true;
     g_session_active = true;
     return true;
 }
@@ -661,7 +691,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
         reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: readback ok");
         // R16G16F output texture (ReShade-owned) + CPU upload staging (native).
         {
-            const uint32_t gw = sw / 4, gh = sh / 4;
+            const uint32_t gw = (sw + 3) / 4, gh = (sh + 3) / 4;
             const resource_desc tdesc(gw, gh, 1, 1, format::r16g16_float, 1, memory_heap::default_,
                                       resource_usage::copy_dest | resource_usage::shader_resource);
             resource out_tex = { 0 };
@@ -1038,14 +1068,26 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         in_params.referenceFrame = g_input_bufs[just_filled];
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
         out_params.outputBuffer = g_out_buf;
+        out_params.outputCostBuffer = nullptr; // enableOutputCost=FALSE (OpenCV-faithful)
+        out_params.hPrivData = nullptr;
         const NV_OF_STATUS ost = g_of.nvOFExecute(g_of_handle, &in_params, &out_params);
         if (ost != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(ost);
+            // Driver detail string (once per failure burst; overlay shows it).
+            if (g_of.nvOFGetLastError != nullptr)
+            {
+                char err[256] = {};
+                uint32_t errsz = sizeof(err);
+                if (g_of.nvOFGetLastError(g_of_handle, err, &errsz) == NV_OF_SUCCESS && err[0] != '\0')
+                    g_last_of_error.assign(err);
+            }
             if (g_exec_ok)
             {
                 g_exec_ok = false;
-                set_status_locked("nvOFExecute failed", reshade::log::level::warning);
+                std::string msg = std::string("nvOFExecute failed") +
+                    (g_last_of_error.empty() ? "" : std::string(" : ") + g_last_of_error);
+                set_status_locked(msg.c_str(), reshade::log::level::warning);
             }
         }
         else
@@ -1219,6 +1261,10 @@ static void draw_overlay(effect_runtime *)
     float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f;
     char target_tex[128] = {};
     int last_cu = 0, last_of = 0;
+    std::string last_of_err;
+    uint32_t grids_list[8] = {};
+    uint32_t grids_count = 0;
+    uint32_t cap_roi = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         status = g_status;
@@ -1244,6 +1290,11 @@ static void draw_overlay(effect_runtime *)
         flow_scale = g_flow_scale;
         last_cu = g_last_cu_code;
         last_of = g_last_of_code;
+        last_of_err = g_last_of_error;
+        grids_count = (g_cap_grids_count <= 8) ? g_cap_grids_count : 8;
+        for (uint32_t i = 0; i < grids_count; ++i)
+            grids_list[i] = g_cap_grids_list[i];
+        cap_roi = g_cap_roi;
 #if defined(_MSC_VER)
         strncpy_s(target_tex, g_target_tex, sizeof(target_tex) - 1);
 #else
@@ -1251,7 +1302,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali0]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali1]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1269,7 +1320,17 @@ static void draw_overlay(effect_runtime *)
     ImGui::Text("D3D12 device seen: %s", d3d12_seen ? "yes" : "no");
     ImGui::Text("NvOF session: %s", session ? "active" : "inactive");
     if (caps_ok)
+    {
         ImGui::Text("Caps: %ux%u .. %ux%u, out grids mask 0x%X", wmin, hmin, wmax, hmax, grids);
+        if (grids_count > 0)
+        {
+            std::string gs = "Grids:";
+            for (uint32_t i = 0; i < grids_count; ++i)
+                gs += " " + std::to_string(grids_list[i]);
+            gs += " | ROI support: " + std::to_string(cap_roi);
+            ImGui::TextUnformatted(gs.c_str());
+        }
+    }
     if (fw != 0)
         ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu, skips %llu, executes %llu", fw, fh, frames,
                     memcpys, skips, executes);
@@ -1295,6 +1356,8 @@ static void draw_overlay(effect_runtime *)
     if (target_tex[0] != '\0')
         ImGui::Text("Target '%s': %s", target_tex, target_ok ? "injected" : (target_found ? "found" : "not found"));
     ImGui::Text("Last codes: CU %d, OF %d", last_cu, last_of);
+    if (!last_of_err.empty())
+        ImGui::TextWrapped("OF detail: %s", last_of_err.c_str());
     ImGui::TextWrapped("%s", status.c_str());
 }
 
