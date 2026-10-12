@@ -54,8 +54,15 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.11
         id: cuda-toolkit
         with:
-          cuda: '12.6.0'
+          cuda: '12.6'
           method: 'network'
+
+      - name: Debug CUDA install
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          if (Test-Path "$env:CUDA_PATH/include/cuda.h") { Write-Host "cuda.h present" } else { Write-Host "cuda.h MISSING"; exit 1 }
+          Get-ChildItem "$env:CUDA_PATH" | Select-Object Name
 
       - name: Verify inputs
         shell: pwsh
