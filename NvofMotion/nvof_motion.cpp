@@ -134,6 +134,8 @@ CUarray g_input_arrays[2] = { nullptr, nullptr };
 NvOFGPUBufferHandle g_out_buf = nullptr;
 CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
+CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
+CUfunction g_convert_fn = nullptr; // (teardown stays null-safe)
 uint32_t g_grid_w = 0, g_grid_h = 0;
 // R16G16F output texture (ReShade-owned) + CPU upload staging (native).
 resource g_out_tex = { 0 };
@@ -914,7 +916,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     {
         // First frame or resize/format change: rebuild pipeline.
         // Drain the GPU only when live objects exist (first build has nothing
-        // in flight; wait_idle on a fresh device Henriks stall/deadlock).
+        // in flight; wait_idle on a fresh device risks stall/deadlock).
         // (teardown/build manage the CUDA context themselves.)
         if (g_session_active || g_readback != nullptr)
             queue->wait_idle();
