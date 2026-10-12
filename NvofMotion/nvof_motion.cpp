@@ -134,7 +134,6 @@ CUarray g_input_arrays[2] = { nullptr, nullptr };
 NvOFGPUBufferHandle g_out_buf = nullptr;
 CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
-NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
 CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
 CUfunction g_convert_fn = nullptr; // (teardown stays null-safe)
 uint32_t g_grid_w = 0, g_grid_h = 0;
@@ -416,6 +415,12 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         g_of_handle = hOf;
 
         g_crash_stage = 2;
+        NV_OF_STATUS sts = g_of.nvOFSetIOCudaStreams(hOf, g_stream, g_stream);
+        if (sts != NV_OF_SUCCESS)
+        {
+            g_last_of_code = static_cast<int>(sts);
+            return false;
+        }
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
@@ -747,11 +752,6 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
 
         g_frame_w = w;
         g_frame_h = h;
-        // Diagnostic ROI: largest legal rect at grid 4 (start/size aligned).
-        g_roi.start_x = 0;
-        g_roi.start_y = 0;
-        g_roi.width = (w / 128) * 128;
-        g_roi.height = (h / 32) * 32;
         ok = true;
     } while (false);
 
@@ -1248,7 +1248,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [roi1]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [streams]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
