@@ -747,6 +747,11 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
 
         g_frame_w = w;
         g_frame_h = h;
+        // Diagnostic ROI: largest legal rect at grid 4 (start/size aligned).
+        g_roi.start_x = 0;
+        g_roi.start_y = 0;
+        g_roi.width = (w / 128) * 128;
+        g_roi.height = (h / 32) * 32;
         ok = true;
     } while (false);
 
@@ -1026,6 +1031,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         in_params.inputFrame = g_input_bufs[1 - just_filled];
         in_params.referenceFrame = g_input_bufs[just_filled];
         in_params.disableTemporalHints = NV_OF_TRUE;
+        in_params.numRois = 1;
+        in_params.roiData = &g_roi;
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
         out_params.outputBuffer = g_out_buf;
         const NV_OF_STATUS ost = g_of.nvOFExecute(g_of_handle, &in_params, &out_params);
