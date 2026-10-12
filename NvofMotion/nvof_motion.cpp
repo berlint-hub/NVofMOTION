@@ -1032,12 +1032,10 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         !g_of_cpu.empty())
     {
         const int just_filled = static_cast<int>(g_frames_captured % 2);
+        // DALI-faithful: zero-init only (no ROI, no hints flags).
         NV_OF_EXECUTE_INPUT_PARAMS in_params = {};
         in_params.inputFrame = g_input_bufs[1 - just_filled];
         in_params.referenceFrame = g_input_bufs[just_filled];
-        in_params.disableTemporalHints = NV_OF_TRUE;
-        in_params.numRois = 1;
-        in_params.roiData = &g_roi;
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
         out_params.outputBuffer = g_out_buf;
         const NV_OF_STATUS ost = g_of.nvOFExecute(g_of_handle, &in_params, &out_params);
@@ -1253,7 +1251,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [streams]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali0]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
