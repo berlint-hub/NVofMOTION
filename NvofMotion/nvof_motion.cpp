@@ -25,6 +25,7 @@
 #include <d3d12.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -116,6 +117,9 @@ uint64_t g_frames_captured = 0;
 uint64_t g_memcpys_done = 0;
 int g_last_cu_code = 0;
 int g_last_of_code = 0;
+// SEH forensics: which bring-up stage crashed + exception code (0 = no crash).
+int g_crash_stage = 0;
+bool g_crashed_nvof = false;
 
 // cached caps for the overlay (no CUDA calls from overlay thread)
 uint32_t g_cap_wmin = 0, g_cap_wmax = 0, g_cap_hmin = 0, g_cap_hmax = 0;
@@ -286,45 +290,107 @@ void teardown_all_locked()
     g_owner_device = nullptr;
 }
 
+// POD-only NvOF bring-up with SEH guard: any driver crash inside becomes a
+// reported status (stage + exception code) instead of a dead process.
+// Stages: 1 = create handle, 2 = init, 3/4 = input buffers.
+// Returns false on error or exception. On exception, handles are deliberately
+// leaked (never touch the driver again on that path); g_crashed_nvof is set.
+// NOTE: no unwindable locals in here (C2712) - POD and globals only.
+bool create_of_nvof_locked(uint32_t w, uint32_t h)
+{
+    g_crash_stage = 0;
+    g_crashed_nvof = false;
+    __try
+    {
+        g_crash_stage = 1;
+        NvOFHandle hOf = nullptr;
+        NV_OF_STATUS st = g_of.nvCreateOpticalFlowCuda(g_cu_ctx, &hOf);
+        if (st != NV_OF_SUCCESS || hOf == nullptr)
+        {
+            g_last_of_code = static_cast<int>(st);
+            return false;
+        }
+        g_of_handle = hOf;
+
+        g_crash_stage = 2;
+        NV_OF_INIT_PARAMS init = {};
+        init.width = w;
+        init.height = h;
+        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+        init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_4;
+        init.mode = NV_OF_MODE_OPTICALFLOW;
+        init.perfLevel = NV_OF_PERF_LEVEL_FAST;
+        init.enableExternalHints = NV_OF_FALSE;
+        init.enableOutputCost = NV_OF_TRUE;
+        init.hPrivData = nullptr;
+
+        st = g_of.nvOFInit(hOf, &init);
+        if (st != NV_OF_SUCCESS)
+        {
+            g_last_of_code = static_cast<int>(st);
+            return false;
+        }
+
+        for (int i = 0; i < 2; ++i)
+        {
+            g_crash_stage = 3 + i;
+            NV_OF_BUFFER_DESCRIPTOR desc = {};
+            desc.width = w;
+            desc.height = h;
+            desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
+            desc.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
+            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_input_bufs[i]);
+            if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
+            {
+                g_last_of_code = static_cast<int>(st);
+                return false;
+            }
+            g_input_arrays[i] = g_of.nvOFGPUBufferGetCUarray(g_input_bufs[i]);
+            if (g_input_arrays[i] == nullptr)
+                return false;
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        g_last_of_code = static_cast<int>(GetExceptionCode());
+        g_crashed_nvof = true;
+        return false;
+    }
+}
+
 // (Re)builds NvOF session + 2 input buffers at W x H. ctx must be current.
 bool create_of_locked(uint32_t w, uint32_t h)
 {
     destroy_of_locked();
 
-    NvOFHandle hOf = nullptr;
-    NV_OF_STATUS st = g_of.nvCreateOpticalFlowCuda(g_cu_ctx, &hOf);
-    if (st != NV_OF_SUCCESS || hOf == nullptr)
+    if (!create_of_nvof_locked(w, h))
     {
-        g_last_of_code = static_cast<int>(st);
-        set_status_locked("nvCreateOpticalFlowCuda failed", reshade::log::level::warning);
-        return false;
-    }
-    g_of_handle = hOf;
-
-    NV_OF_INIT_PARAMS init = {};
-    init.width = w;
-    init.height = h;
-    init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
-    init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_4;
-    init.mode = NV_OF_MODE_OPTICALFLOW;
-    init.perfLevel = NV_OF_PERF_LEVEL_FAST;
-    init.enableExternalHints = NV_OF_FALSE;
-    init.enableOutputCost = NV_OF_TRUE;
-    init.hPrivData = nullptr;
-
-    st = g_of.nvOFInit(hOf, &init);
-    if (st != NV_OF_SUCCESS)
-    {
-        g_last_of_code = static_cast<int>(st);
-        set_status_locked("nvOFInit failed", reshade::log::level::warning);
-        destroy_of_locked();
+        if (g_crashed_nvof)
+        {
+            // Driver crashed mid-bring-up: leak handles on purpose, report it.
+            g_of_handle = nullptr;
+            g_input_bufs[0] = nullptr;
+            g_input_bufs[1] = nullptr;
+            g_input_arrays[0] = nullptr;
+            g_input_arrays[1] = nullptr;
+            char code[32] = {};
+            snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned int>(g_last_of_code));
+            const std::string msg = std::string("[NVOF Motion] DRIVER CRASH in bring-up (stage ") +
+                std::to_string(g_crash_stage) + ", code " + code + ") - staying idle";
+            set_status_locked(msg.c_str(), reshade::log::level::error);
+        }
+        else
+        {
+            destroy_of_locked();
+        }
         return false;
     }
 
     auto query_cap = [&](NV_OF_CAPS cap, uint32_t &out) {
         uint32_t val = 0;
         uint32_t size = sizeof(val);
-        if (g_of.nvOFGetCaps(hOf, cap, &val, &size) == NV_OF_SUCCESS)
+        if (g_of.nvOFGetCaps(g_of_handle, cap, &val, &size) == NV_OF_SUCCESS)
         {
             out = val;
             return true;
@@ -336,30 +402,6 @@ bool create_of_locked(uint32_t w, uint32_t h)
         query_cap(NV_OF_CAPS_HEIGHT_MIN, g_cap_hmin) &
         query_cap(NV_OF_CAPS_HEIGHT_MAX, g_cap_hmax);
     query_cap(NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, g_cap_grids);
-
-    for (int i = 0; i < 2; ++i)
-    {
-        NV_OF_BUFFER_DESCRIPTOR desc = {};
-        desc.width = w;
-        desc.height = h;
-        desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
-        desc.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
-        st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_input_bufs[i]);
-        if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
-        {
-            g_last_of_code = static_cast<int>(st);
-            set_status_locked("nvOFCreateGPUBufferCuda (input) failed", reshade::log::level::warning);
-            destroy_of_locked();
-            return false;
-        }
-        g_input_arrays[i] = g_of.nvOFGPUBufferGetCUarray(g_input_bufs[i]);
-        if (g_input_arrays[i] == nullptr)
-        {
-            set_status_locked("nvOFGPUBufferGetCUarray failed", reshade::log::level::warning);
-            destroy_of_locked();
-            return false;
-        }
-    }
 
     {
         const std::string msg =
