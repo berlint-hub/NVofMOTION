@@ -10,6 +10,10 @@ Rozšíření proti built-inu:
   pro width i height (`[DEPTH] FilterResolutionMinWidth/MaxWidth/MinHeight/MaxHeight`,
   `0` = bez limitu na té straně)
 - prázdné staty vždy prohrávají (ochrana proti UI/mini bufferům)
+- `Auto refresh every N frames` (`[DEPTH] AutoRefreshFrames`, default 600, `0` = off) –
+  po N snímcích shodí výběr a detekce začne znovu podle zadané heuristiky
+  (léčí zaseknutý depth po změně scény, např. menu → závod).
+  Při ručním override (checkbox u bufferu) se refresh přeskočí.
 
 Tip pro PCSX2: když se šířka nemění a výška skáče, nastav
 `Aspect ratio heuristic = Match custom width and height range`,
