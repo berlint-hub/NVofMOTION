@@ -147,6 +147,15 @@ std::string cuda_error_text(CUresult res)
     return "CUDA error " + std::to_string(static_cast<int>(res));
 }
 
+// Records the numeric code (shown in overlay) plus a readable status line.
+void set_cu_status_locked(const char *what, CUresult cu)
+{
+    g_last_cu_code = static_cast<int>(cu);
+    const std::string msg =
+        std::string(what) + " (CU " + std::to_string(static_cast<int>(cu)) + ": " + cuda_error_text(cu) + ")";
+    set_status_locked(msg.c_str(), reshade::log::level::warning);
+}
+
 // Tries primary symbol name, then fallback (driver exports vary by version).
 FARPROC load_sym(HMODULE mod, const char *primary, const char *fallback = nullptr)
 {
@@ -427,17 +436,21 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
             CUDA_EXTERNAL_SEMAPHORE_HANDLE_DESC sem_desc = {};
             sem_desc.type = CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE;
             sem_desc.handle.win32.handle = g_fence_handle;
-            if (p_cuImportExternalSemaphore(&g_cuda_sem, &sem_desc) != CUDA_SUCCESS || g_cuda_sem == nullptr)
             {
-                set_status_locked("cuImportExternalSemaphore failed", reshade::log::level::warning);
-                break;
+                const CUresult src = p_cuImportExternalSemaphore(&g_cuda_sem, &sem_desc);
+                if (src != CUDA_SUCCESS || g_cuda_sem == nullptr)
+                {
+                    set_cu_status_locked("cuImportExternalSemaphore failed", src);
+                    break;
+                }
             }
         }
         if (g_stream == nullptr)
         {
-            if (p_cuStreamCreate(&g_stream, 0) != CUDA_SUCCESS || g_stream == nullptr)
+            const CUresult src = p_cuStreamCreate(&g_stream, 0);
+            if (src != CUDA_SUCCESS || g_stream == nullptr)
             {
-                set_status_locked("cuStreamCreate failed", reshade::log::level::warning);
+                set_cu_status_locked("cuStreamCreate failed", src);
                 break;
             }
         }
@@ -483,14 +496,19 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
             mem_desc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE;
             mem_desc.handle.win32.handle = shared_handle;
             mem_desc.size = alloc_info.SizeInBytes;
+            // Committed D3D12 resources are dedicated allocations.
+            mem_desc.flags = CUDA_EXTERNAL_MEMORY_DEDICATED;
 
             CUexternalMemory ext_mem = nullptr;
-            if (p_cuImportExternalMemory(&ext_mem, &mem_desc) != CUDA_SUCCESS || ext_mem == nullptr)
             {
-                CloseHandle(shared_handle);
-                tex->Release();
-                set_status_locked("cuImportExternalMemory failed", reshade::log::level::warning);
-                break;
+                const CUresult imr = p_cuImportExternalMemory(&ext_mem, &mem_desc);
+                if (imr != CUDA_SUCCESS || ext_mem == nullptr)
+                {
+                    CloseHandle(shared_handle);
+                    tex->Release();
+                    set_cu_status_locked("cuImportExternalMemory failed", imr);
+                    break;
+                }
             }
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
             d3d12->GetCopyableFootprints(&tex_desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
@@ -499,13 +517,16 @@ bool build_pipeline_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
             buf_desc.offset = 0;
             buf_desc.size = alloc_info.SizeInBytes;
             CUdeviceptr mapped = 0;
-            if (p_cuExternalMemoryGetMappedBuffer(&mapped, ext_mem, &buf_desc) != CUDA_SUCCESS || mapped == 0)
             {
-                p_cuDestroyExternalMemory(ext_mem);
-                CloseHandle(shared_handle);
-                tex->Release();
-                set_status_locked("cuExternalMemoryGetMappedBuffer failed", reshade::log::level::warning);
-                break;
+                const CUresult mmr = p_cuExternalMemoryGetMappedBuffer(&mapped, ext_mem, &buf_desc);
+                if (mmr != CUDA_SUCCESS || mapped == 0)
+                {
+                    p_cuDestroyExternalMemory(ext_mem);
+                    CloseHandle(shared_handle);
+                    tex->Release();
+                    set_cu_status_locked("cuExternalMemoryGetMappedBuffer failed", mmr);
+                    break;
+                }
             }
 
             g_slots[i].tex = tex;
@@ -780,6 +801,7 @@ static void draw_overlay(effect_runtime *)
     uint32_t wmin = 0, wmax = 0, hmin = 0, hmax = 0, grids = 0;
     uint64_t frames = 0, memcpys = 0;
     uint32_t fw = 0, fh = 0;
+    int last_cu = 0, last_of = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         status = g_status;
@@ -795,6 +817,8 @@ static void draw_overlay(effect_runtime *)
         memcpys = g_memcpys_done;
         fw = g_frame_w;
         fh = g_frame_h;
+        last_cu = g_last_cu_code;
+        last_of = g_last_of_code;
     }
 
     ImGui::TextUnformatted("NVOF Motion (phase 2a: capture, no execute)");
@@ -818,6 +842,7 @@ static void draw_overlay(effect_runtime *)
         ImGui::Text("Caps: %ux%u .. %ux%u, out grids mask 0x%X", wmin, hmin, wmax, hmax, grids);
     if (fw != 0)
         ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu", fw, fh, frames, memcpys);
+    ImGui::Text("Last codes: CU %d, OF %d", last_cu, last_of);
     ImGui::TextWrapped("%s", status.c_str());
 }
 
