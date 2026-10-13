@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`, `[d3d12-2]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -129,8 +129,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   the game device, DEFAULT R8_UNORM inputs + R16G16_SINT grid output,
   UPLOAD/READBACK staging, app/ofa fences (stock AppOFD3D12 discipline:
   upload signals app++, execute waits app + signals ofa++, download waits
-  ofa), grid1/MEDIUM/gray/input-older/temporal-on. If execute passes,
-  phase 2b is unblocked – then tune (grid4/FAST) + phase 2c consumer.
+  ofa), grid1/MEDIUM/gray/input-older/temporal-on. First run: OF5 with a
+  SPECIFIC driver message (`numFencePoints must be atleast 1`) – the D3D12
+  path validates and reports, unlike CUDA's generic `Internal execution
+  status`.
+- Current test build `[d3d12-2]` = `in12.numFencePoints = 1` (single input
+  fence, stock `NvOFBatchExecute` passes 1).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
