@@ -732,7 +732,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-11] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-12] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -760,7 +760,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-11] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-12] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1280,7 +1280,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-11] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-12] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1359,7 +1359,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-11] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-12] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 60th execute: frozen vs live data?
@@ -1378,7 +1378,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-11] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-12] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1454,18 +1454,28 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             }
             // Optional injection into a named effect texture (PPOM-style compat).
             bool found = false, injected = false;
+            uint64_t dbg_var = 0, dbg_srv = 0, dbg_res = 0;
+            int dbg_type = -1, dbg_fmt = -1;
+            uint32_t dbg_tw = 0, dbg_th = 0;
             if (g_target_tex[0] != '\0')
             {
                 const effect_texture_variable var = runtime->find_texture_variable(nullptr, g_target_tex);
                 if (var.handle != 0)
                 {
                     found = true;
+                    dbg_var = var.handle;
                     resource_view srv = { 0 }, srv_srgb = { 0 };
                     runtime->get_texture_binding(var, &srv, &srv_srgb);
                     if (srv.handle != 0)
                     {
+                        dbg_srv = srv.handle;
                         const resource tres = dev->get_resource_from_view(srv);
+                        dbg_res = tres.handle;
                         const resource_desc tdesc = dev->get_resource_desc(tres);
+                        dbg_type = static_cast<int>(tdesc.type);
+                        dbg_fmt = static_cast<int>(tdesc.texture.format);
+                        dbg_tw = tdesc.texture.width;
+                        dbg_th = tdesc.texture.height;
                         if (tdesc.type == resource_type::texture_2d &&
                             tdesc.texture.format == format::r16g16_float &&
                             tdesc.texture.width == g_grid_w && tdesc.texture.height == g_grid_h)
@@ -1501,6 +1511,27 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             }
             g_target_found = found;
             g_target_ok = injected;
+            {
+                // Injection diagnostics: first 3 attempts + every outcome change.
+                static int inj_logged = 0;
+                static int last_state = -1;
+                const int state = (found ? 1 : 0) * 2 + (injected ? 1 : 0);
+                if (inj_logged < 3 || state != last_state)
+                {
+                    inj_logged++;
+                    last_state = state;
+                    char buf[512] = {};
+                    snprintf(buf, sizeof(buf),
+                             "[d3d12-12] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "type=%d fmt=%d %ux%u (want r16g16_float %ux%u)",
+                             g_target_tex, found ? 1 : 0, injected ? 1 : 0,
+                             static_cast<unsigned long long>(dbg_var),
+                             static_cast<unsigned long long>(dbg_srv),
+                             static_cast<unsigned long long>(dbg_res), dbg_type, dbg_fmt, dbg_tw, dbg_th,
+                             g_grid_w, g_grid_h);
+                    dbglog(buf);
+                }
+            }
             {
                 D3D12_RESOURCE_BARRIER to_sr2 = {};
                 to_sr2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1583,7 +1614,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-11]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-12]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
