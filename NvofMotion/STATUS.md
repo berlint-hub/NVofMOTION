@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-6]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-7]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -158,9 +158,16 @@ buffer – impossible on PCSX2, PS2-era games have none).
   CORRECT, but synth +8px pattern reads ~0.06 (WRONG – probe reads +8.00
   with the identical pattern). Only remaining diffs vs probe for synth:
   temporal OFF (probe ON), grid4 (probe grid1), FAST (probe MEDIUM).
-- Current test build `[d3d12-6]` = temporal back ON (single variable).
-  If synth reads +8 → temporal-OFF path zeroes steady motion on this
-  stack (keep ON). If synth still ~0 → next grid1, then MEDIUM.
+- `[d3d12-6]` temporal back ON: SKIP (user didn't test, superseded).
+- **VICTORY `[d3d12-5]` re-enabled: EVERYTHING WORKS.** Temporal OFF is the
+  fix – with temporal ON the corner diverges (-21 -> -201) and the field
+  goes sluggish/unresponsive; with OFF the vectors track the game.
+  (Synth self-test read ~0.06 – pattern-specific FAST/grid4 quirk or mixed
+  frames, irrelevant now that game content tracks.)
+- Current test build `[d3d12-7]` = locks in the winner: temporal OFF,
+  synth toggle kept, grid4/FAST/R8/noExt/noCost/input-older. Skip d3d12-6.
+  NEXT: phase 2c consumer (`MotionVectors` binding already updates every
+  frame) + visual check.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
