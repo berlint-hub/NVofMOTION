@@ -13,16 +13,7 @@ texture motion_vectors_tex
     Height = 360;
     Format = RG16F;
 };
-sampler MotionSampler
-{
-    Texture = motion_vectors_tex;
-    MinFilter = POINT;
-    MagFilter = POINT;
-    MipFilter = POINT;
-    AddressU = CLAMP;
-    AddressV = CLAMP;
-};
-sampler MotionSampler
+sampler NVOFMotionSampler
 {
     Texture = motion_vectors_tex;
     MinFilter = POINT;
@@ -57,7 +48,7 @@ float3 HsvToRgb(float3 c)
 // Middlebury-style: direction -> hue, magnitude -> brightness/saturation.
 float4 PS_FlowVis(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
-    float2 flow = tex2D(MotionSampler, uv).xy;
+    float2 flow = tex2D(NVOFMotionSampler, uv).xy;
     float mag = length(flow);
     float hue = frac(atan2(flow.y, flow.x) / 6.2831853 + 1.0);
     float sat = saturate(mag * FlowVisScale * 4.0);
