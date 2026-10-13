@@ -98,11 +98,18 @@ buffer – impossible on PCSX2, PS2-era games have none).
   (bring-up NvOF calls work, direct calls don't). Primary hypothesis dead.
 - Current test build `[dali13]` (still OF5): SLOW preset, no change –
   preset ruled out.
-- Current test build `[dali14]` = `outGridSize` 4->1 (densest, full-res
-  output 3456x1440; last untested init axis, caps list 1 2 4).
-- If `[dali14]` still OF5: STOP blind bisect. Needed from the rig: driver
-  version (`nvidia-smi`), stock SDK sample result (proves machine vs code),
-  or SDK 5.x headers (your NVIDIA account download) for the `apiVer` bump.
+- Current test build `[dali14]` (still OF5): outGridSize 1, full-res output
+  (3456x1440, pitch 13824) – grid ruled out. ALL client-side axes exhausted:
+  hints on/off, temporal on/off, ROI on/off, hintGrid 4/UNDEF, SetIO
+  before/after/absent, buffers CUARRAY/CUDEVICEPTR, format ABGR8/GRAY8,
+  input/ref order, align 8/128, sizes 3440+1718, static/animated content,
+  fresh ctx (OF5) vs primary ctx (CU 201 on direct calls), FAST/SLOW,
+  grid 4/1. First execute always OF 5 + generic `Internal execution status`.
+- STOP blind bisect. Needed from the rig (pick any): (1) driver version
+  (`nvidia-smi` – asked 3x, still unknown!), (2) stock SDK sample result
+  (AppOF CUDA from NVIDIAOpticalFlowSDK – machine vs code verdict),
+  (3) SDK 5.x headers (gated download with your NVIDIA account) for the
+  `apiVer` bump (public GitHub headers are stale at 2.0).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
