@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-3]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-4]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -138,10 +138,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - BREAKTHROUGH `[d3d12-2]`: **`first execute OK`, executes 162/163,
   OF 0** on the rig. The missing `numFencePoints` was the only defect.
   CUDA era closed (19 builds, params exonerated, probe keeps passing).
-- Current test build `[d3d12-3]` = production config: grid1->grid4
-  (860x360 at 3440x1440) + preset MEDIUM->FAST. All geometry is
-  `kOutGrid`-parameterized. Open: vector sanity (avg looked high –
-  needs visual check via `MotionVectors` binding), then phase 2c.
+- `[d3d12-3]` production grid4 + FAST executes fine (240/241, OF 0).
+- `[d3d12-4]` vector telemetry (every 60th execute: avg, corner/center
+  vecs, download hash, gray checksum). Open question: user reports frozen
+  DATA (numbers don't track motion). NOTE: overlay `Flow scale` reads
+  **0.624**, true S10.5 scale is **0.03125** (20x!) – reset to 0.031.
+  Telemetry decides: constant dlhash + changing graysum = stale download;
+  changing dlhash = live vectors (then scale/interpretation).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

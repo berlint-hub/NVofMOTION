@@ -729,7 +729,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-3] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8) caps %u-%u x %u-%u "
+                 "[d3d12-4] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -757,7 +757,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-3] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-4] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1253,7 +1253,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-3] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-4] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1332,7 +1332,31 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-3] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-4] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                dbglog(buf);
+            }
+            // Vector telemetry every 60th execute: frozen vs live data?
+            if ((g_executes % 60) == 1)
+            {
+                const size_t cx = g_grid_w / 2, cy = g_grid_h / 2;
+                const size_t ci = (cy * g_grid_w + cx) * 2;
+                const size_t li = ((g_grid_h - 1) * g_grid_w + (g_grid_w - 1)) * 2;
+                uint64_t dlhash = 1469598103934665603ULL;
+                const uint8_t *db = reinterpret_cast<const uint8_t *>(g_of_cpu.data());
+                const size_t dbsz = g_of_cpu.size() * sizeof(int16_t);
+                for (size_t bi = 0; bi < dbsz; bi += 64)
+                {
+                    dlhash ^= db[bi];
+                    dlhash *= 1099511628211ULL;
+                }
+                char buf[512] = {};
+                snprintf(buf, sizeof(buf),
+                         "[d3d12-4] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "graysum=%llx",
+                         static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
+                         g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
+                         g_of_cpu[li] / 32.0f, g_of_cpu[li + 1] / 32.0f,
+                         static_cast<unsigned long long>(dlhash), static_cast<unsigned long long>(sum));
                 dbglog(buf);
             }
             have_vectors = true;
@@ -1514,7 +1538,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-3]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-4]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
