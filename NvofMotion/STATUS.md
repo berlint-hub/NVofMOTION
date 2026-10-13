@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali10]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali11]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -85,11 +85,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   async (NULL-stream ordering is safe via legacy sync), ROI rules confirmed.
 - Current test build `[dali9]` (still OF5): temporal on, no change – the
   byte-identical OpenCV recipe fails here, so it is environmental.
-- Current test build `[dali10]` = retained PRIMARY CUDA context instead of
-  fresh `cuCtxCreate` (both proven stacks – OpenCV runtime, DALI – run NvOF
-  on the primary). Release (not destroy) at teardown.
-- If `[dali10]` still OF5, next: perfLevel FAST->SLOW, then driver version
-  check/reinstall, then `apiVer` (gated SDK 5.x headers).
+- Current test build `[dali10]` (INCONCLUSIVE + new symptom): session builds
+  fine on the primary ctx (new 0xC0D... pointers), but per-frame fails with
+  CU 201 (INVALID_CONTEXT), memcpys 0 – execute never reached.
+- Current test build `[dali11]` = ctx diagnostics only (still primary ctx):
+  `cuCtxGetCurrent` stickiness check (`CTX build`/`CTX frame` in debug log)
+  + loud set-current failures. This pinpoints WHERE the 201 comes from.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
