@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-9]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-10]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -178,9 +178,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
   from `_texture_semantic_bindings` filled by `update_texture_bindings`):
   the effect must declare `texture MotionTex : MotionVectors` (SEMANTIC),
   not `source`. Fixed; retest.
-- Current test build `[d3d12-9]` = temporal ON + synth toggle (strong
-  pattern) + telemetry + grid4/FAST. Phase 2b effectively DONE pending
-  visual check; next phase 2c consumer.
+- Current test build `[d3d12-10]` = PPOM-style in-menu debug view
+  (`ImGui::Image` on our R16G16F SRV, raw R/G = flow XY, checkbox
+  "Show flow texture"). Bypasses the effect/binding path entirely –
+  shows whether the texture really updates. NOTE: overlay
+  "Target '...': not found" is the INJECTION target (needs an effect to
+  declare that texture) – expected, not a bug. The semantic-binding
+  `.fx` path is still unverified on the rig.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

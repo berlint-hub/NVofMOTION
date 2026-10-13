@@ -160,6 +160,7 @@ uint64_t g_frames_captured = 0;
 uint64_t g_memcpys_done = 0;
 int g_last_of_code = 0;
 bool g_synth_test = false; // overlay toggle: synthetic +8px pair instead of game frames
+bool g_show_tex = false; // overlay toggle: debug view of the flow texture (PPOM-style)
 std::string g_last_of_error; // nvOFGetLastError text for the last execute failure
 // SEH forensics: which bring-up stage crashed + exception code (0 = no crash).
 int g_crash_stage = 0;
@@ -730,7 +731,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-9] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-10] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -758,7 +759,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-9] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-10] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1278,7 +1279,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-9] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-10] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1357,7 +1358,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-9] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-10] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 60th execute: frozen vs live data?
@@ -1376,7 +1377,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-9] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-10] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1523,6 +1524,9 @@ static void draw_overlay(effect_runtime *)
     float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f;
     char target_tex[128] = {};
     int last_of = 0;
+    bool show_tex = false;
+    uint64_t flow_srv = 0;
+    uint32_t gw = 0, gh = 0;
     std::string last_of_err;
     uint32_t grids_list[8] = {};
     uint32_t grids_count = 0;
@@ -1551,6 +1555,10 @@ static void draw_overlay(effect_runtime *)
         flow_moving = g_flow_moving_pct;
         flow_scale = g_flow_scale;
         last_of = g_last_of_code;
+        show_tex = g_show_tex;
+        flow_srv = g_out_srv.handle;
+        gw = g_grid_w;
+        gh = g_grid_h;
         last_of_err = g_last_of_error;
         grids_count = (g_cap_grids_count <= 8) ? g_cap_grids_count : 8;
         for (uint32_t i = 0; i < grids_count; ++i)
@@ -1563,7 +1571,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-9]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-10]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1584,6 +1592,21 @@ static void draw_overlay(effect_runtime *)
             std::lock_guard<std::mutex> lock(g_mutex);
             g_synth_test = synth;
         }
+    }
+    {
+        bool show = show_tex;
+        if (ImGui::Checkbox("Show flow texture (debug view)", &show))
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_show_tex = show;
+        }
+    }
+    if (show_tex && flow_srv != 0 && gw > 0 && gh > 0)
+    {
+        // PPOM-style in-menu debug view: raw R16G16F (R/G = flow XY).
+        const float disp_w = 430.0f;
+        const float disp_h = disp_w * static_cast<float>(gh) / static_cast<float>(gw);
+        ImGui::Image((ImTextureID)flow_srv, ImVec2(disp_w, disp_h));
     }
 
     ImGui::Text("D3D12 device seen: %s", d3d12_seen ? "yes" : "no");
