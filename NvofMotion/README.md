@@ -38,6 +38,14 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 - Backbuffer R8G8B8A8 (otherwise idle with status)
 - On AMD/Intel or without those DLLs the add-on stays idle (see overlay)
 
+## License
+
+MIT – see `LICENSE`. This directory contains only original code (addon,
+probe, debug effect, docs). Build-time dependencies are fetched by CI,
+not redistributed: ReShade headers (BSD-3-Clause, crosire/reshade) and
+NVIDIA Optical Flow SDK headers, API 5.0 (NVIDIA LicenseAgreement,
+via public mirror – see workflow file).
+
 ## Install & config
 
 1. Put `nvof_motion.addon64` next to `ReShade.dll` (or into `AddonPath`).
