@@ -172,12 +172,14 @@ buffer – impossible on PCSX2, PS2-era games have none).
   Both ON and OFF track; canonical = ON (stock/guide default, hints help
   video). Synth-0.06 question stays open (pattern too smooth for FAST?),
   minor.
-- PHASE 2c: `MotionVectors_Debug.fx` failed first (`source = "MotionVectors"`
-  -> "not found in texture search paths"). Decoded from ReShade source
-  (`runtime.cpp load_textures` skips semantic textures; draw resolves SRV
-  from `_texture_semantic_bindings` filled by `update_texture_bindings`):
-  the effect must declare `texture MotionTex : MotionVectors` (SEMANTIC),
-  not `source`. Fixed; retest.
+- PHASE 2c DONE: injection into `motion_vectors_tex` works end-to-end,
+  debug effect visualizes live flow (user: "BOMBAAAAA JEDEEEEEE").
+  Full chain: PCSX2 D3D12 backbuffer -> readback -> luma -> NVOFA (D3D12
+  native, grid4/FAST) -> R16G16F field -> effect texture -> shader.
+  INT16_MIN invalids filtered, telemetry + self-test + in-menu view stay
+  as regression tools.
+- NEXT: perf timings per stage in overlay (user asked about GPU cost),
+  `paths-ignore` for `*.md`, consumer shaders (frame-gen feed).
 - `[d3d12-10]` in-menu view WORKS: live flow field visible (red/green
   directions, black static), executes 10520/10521, avg 12.19px / 94.3%.
   Vectors are real. Overlay "Target: not found" is the INJECTION target
