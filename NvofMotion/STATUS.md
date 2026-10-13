@@ -121,12 +121,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali16]` (still OF5): stock input order, no change.
 - Current test build `[dali17]` (still OF5): exact stock default recipe
   (CUARRAY + MEDIUM + SetIO-nulls) fails identically – params exonerated.
-- Current test build `[dali18]` = SetIO moved BEFORE init (stock
-  `NvOFCudaAPI` ctor order: create -> SetIO -> init -> buffers). Last
-  ordering stone; never tested in the 5.0 configuration.
-- If `[dali18]` still OF5: verdict = machine/driver. Rig runs stock
-  AppOFCuda (mbucchia mirror, needs CUDA toolkit + VS) or changes driver
-  (617.14 suspect).
+- Current test build `[dali18]` (still OF5): stock SetIO order, no change.
+  Code-side bisect EXHAUSTED – our recipe is byte-identical to stock.
+- NEW decisive test: `NvofMotion/probe/nvof_probe.cpp` (built in CI as
+  `nvof_probe-win64` artifact, static runtime, no install needed). Stock
+  recipe (apiVer 5.0, CUARRAY, grid1, MEDIUM, SetIO-nulls, gray8 synthetic
+  pair +8px, input=older, temporal on, fresh ctx) in a CLEAN process
+  (no PCSX2/ReShade). Run on rig, paste console output:
+  PASS = our process breaks NVOFA (new direction); FAIL/OF5 = driver 617.14
+  breaks NvOF generally (try another driver).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
