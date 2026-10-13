@@ -1141,6 +1141,20 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         }
     }
     const int fill_idx = static_cast<int>(g_frames_captured % 2);
+    // Liveness checksum over the luma staging (what NVOFA actually sees).
+    uint64_t sum = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
+    {
+        const uint8_t *gd = g_gray.data();
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            const uint8_t *row = gd + static_cast<size_t>(y) * g_gray_pitch;
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                sum ^= row[x];
+                sum *= 1099511628211ULL; // FNV-1a prime
+            }
+        }
+    }
     // Upload: gray rows -> mapped UPLOAD staging -> registered R8 input (own list).
     {
         uint8_t *dst = static_cast<uint8_t *>(g_in_up_ptr[fill_idx]);
