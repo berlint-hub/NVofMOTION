@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali18]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -121,15 +121,17 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali16]` (still OF5): stock input order, no change.
 - Current test build `[dali17]` (still OF5): exact stock default recipe
   (CUARRAY + MEDIUM + SetIO-nulls) fails identically – params exonerated.
-- Current test build `[dali18]` (still OF5): stock SetIO order, no change.
-  Code-side bisect EXHAUSTED – our recipe is byte-identical to stock.
-- NEW decisive test: `NvofMotion/probe/nvof_probe.cpp` (built in CI as
-  `nvof_probe-win64` artifact, static runtime, no install needed). Stock
-  recipe (apiVer 5.0, CUARRAY, grid1, MEDIUM, SetIO-nulls, gray8 synthetic
-  pair +8px, input=older, temporal on, fresh ctx) in a CLEAN process
-  (no PCSX2/ReShade). Run on rig, paste console output:
-  PASS = our process breaks NVOFA (new direction); FAIL/OF5 = driver 617.14
-  breaks NvOF generally (try another driver).
+- PROBE VERDICT: **PASS** on the rig (apiVer 0x50, driver maxApiVer 0x50,
+  RTX 4080): execute 0 + center vec exactly +8.00px on 640x480 AND
+  3440x1440. Driver 617.14 exonerated, NVOFA healthy. It is OUR
+  process/config, not params (recipe identical) and not the driver.
+- Last remaining config diff probe-vs-addon: probe uses EXACT session dims,
+  addon pads to 128x32 (dali5+). (Pre-padding builds failed too, but those
+  were 2.0-era – never isolated under 5.0.)
+- Current test build `[dali19]` = exact session dims (no padding), rest =
+  `[dali18]`. If it passes, padding was the trigger.
+- If `[dali19]` still OF5: pivot to the native D3D12 NvOF interface
+  (5.0 headers HAVE nvOpticalFlowD3D12.h – same process, no CUDA).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
