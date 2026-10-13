@@ -139,12 +139,16 @@ buffer – impossible on PCSX2, PS2-era games have none).
   OF 0** on the rig. The missing `numFencePoints` was the only defect.
   CUDA era closed (19 builds, params exonerated, probe keeps passing).
 - `[d3d12-3]` production grid4 + FAST executes fine (240/241, OF 0).
-- `[d3d12-4]` vector telemetry (every 60th execute: avg, corner/center
-  vecs, download hash, gray checksum). Open question: user reports frozen
-  DATA (numbers don't track motion). NOTE: overlay `Flow scale` reads
-  **0.624**, true S10.5 scale is **0.03125** (20x!) – reset to 0.031.
-  Telemetry decides: constant dlhash + changing graysum = stale download;
-  changing dlhash = live vectors (then scale/interpretation).
+- `[d3d12-4]` vector telemetry (grid4/FAST): vectors are LIVE, not frozen
+  (`dlhash` differs every 60-frame sample, avg evolves 0->11->28->44).
+  Center/origin sane (~0-16px); bottom-right corner wild (~-200,-65px,
+  likely border effect + PS2 dither noise in flat areas). The "freeze"
+  impression = static scene (stable field is CORRECT) + previously wrong
+  `Flow scale` 0.624 instead of true S10.5 0.03125 (20x). With 0.031 the
+  user reads avg ~44px / 90% moving – needs scene context to judge
+  (fast gameplay = plausible; static menu = noise-driven).
+- NEXT: user reports what the game shows + whether avg tracks camera pans.
+  Then phase 2c consumer (`MotionVectors` binding already updates).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
