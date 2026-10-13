@@ -1,11 +1,13 @@
 // NVOF Motion vectors - debug visualization (phase 2c).
 // The nvof_motion addon publishes its R16G16F flow field (grid4 by default,
-// values in pixels, +x right, +y down) under the "MotionVectors" source name
-// every executed frame. Copy this file next to your other ReShade .fx files
-// and enable the technique. No #includes needed (self-contained).
+// values in pixels, +x right, +y down) under the "MotionVectors" SEMANTIC
+// (via effect_runtime::update_texture_bindings every executed frame).
+// Textures with a semantic are bound by the runtime, not loaded from files.
+// Copy this file next to your other ReShade .fx files and enable it.
+// No #includes needed (self-contained).
 // If the addon is idle/missing, the view stays black.
 
-texture MotionTex < source = "MotionVectors"; >
+texture MotionTex : MotionVectors
 {
     Width = 860;
     Height = 360;

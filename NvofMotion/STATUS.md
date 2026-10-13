@@ -172,11 +172,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   Both ON and OFF track; canonical = ON (stock/guide default, hints help
   video). Synth-0.06 question stays open (pattern too smooth for FAST?),
   minor.
-- PHASE 2c START: `NvofMotion/fx/MotionVectors_Debug.fx` (self-contained,
-  no includes) – Middlebury-style flow->color visualization consuming the
-  `MotionVectors` binding (R16G16F grid4, px units). Copy next to other
-  .fx files, enable, screenshot. The binding already updates every
-  executed frame (`update_texture_bindings` in the texture block).
+- PHASE 2c: `MotionVectors_Debug.fx` failed first (`source = "MotionVectors"`
+  -> "not found in texture search paths"). Decoded from ReShade source
+  (`runtime.cpp load_textures` skips semantic textures; draw resolves SRV
+  from `_texture_semantic_bindings` filled by `update_texture_bindings`):
+  the effect must declare `texture MotionTex : MotionVectors` (SEMANTIC),
+  not `source`. Fixed; retest.
 - Current test build `[d3d12-9]` = temporal ON + synth toggle (strong
   pattern) + telemetry + grid4/FAST. Phase 2b effectively DONE pending
   visual check; next phase 2c consumer.
