@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali12]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali13]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -92,8 +92,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
   (primary attach works), frame fails CU 201 before any CTX check-in – the
   201 comes from frame set-current or the first xfer, not from execute.
   `Scene activity: no` is expected fallout (no upload → no checksum).
-- Current test build `[dali12]` = pinpoint logging: `frame set-current
-  FAILED` vs `frame xfer FAILED` lines (first 3 each) with codes/handles.
+- Current test build `[dali12]` (decisive): frame set-current SUCCEEDS and
+  GetCurrent matches, yet the first xfer (memcpy) returns CU 201 – the
+  retained primary ctx is unusable for direct CUDA calls in this process
+  (bring-up NvOF calls work, direct calls don't). Primary hypothesis dead.
+- Current test build `[dali13]` = revert to fresh `cuCtxCreate` (restores
+  CU 0 frames) + `perfLevel` FAST->SLOW (never verified on Ada; DALI 0.0 is
+  SLOW-class). Clean attribution: fresh+FAST already failed in `[dali9]`.
+- If `[dali13]` still OF5, next: driver version check/reinstall, then
+  `apiVer` (gated SDK 5.x headers).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

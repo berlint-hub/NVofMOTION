@@ -164,7 +164,7 @@ void check_ctx_locked(const char *where)
     {
         logged++;
         char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali12] CTX %s: get=%d cur=%p expected=%p", where,
+        snprintf(buf, sizeof(buf), "[dali13] CTX %s: get=%d cur=%p expected=%p", where,
                  static_cast<int>(g), cur, g_cu_ctx);
         dbglog(buf);
     }
@@ -322,10 +322,11 @@ bool resolve_cuda_symbols_locked()
     NVOF_RESOLVE(p_cuDeviceGetLuid, cuDeviceGetLuid_fn, "cuDeviceGetLuid", nullptr);
     NVOF_RESOLVE(p_cuCtxCreate, cuCtxCreate_fn, "cuCtxCreate", "cuCtxCreate_v2");
     NVOF_RESOLVE(p_cuCtxDestroy, cuCtxDestroy_fn, "cuCtxDestroy", "cuCtxDestroy_v2");
-    NVOF_RESOLVE(p_cuDevicePrimaryCtxRetain, cuDevicePrimaryCtxRetain_fn, "cuDevicePrimaryCtxRetain",
-                 nullptr);
-    NVOF_RESOLVE(p_cuDevicePrimaryCtxRelease, cuDevicePrimaryCtxRelease_fn, "cuDevicePrimaryCtxRelease",
-                 nullptr);
+    // Optional (primary-ctx experiment): must NOT fail bring-up when missing.
+    p_cuDevicePrimaryCtxRetain = reinterpret_cast<cuDevicePrimaryCtxRetain_fn>(
+        load_sym(g_cuda_dll, "cuDevicePrimaryCtxRetain", nullptr));
+    p_cuDevicePrimaryCtxRelease = reinterpret_cast<cuDevicePrimaryCtxRelease_fn>(
+        load_sym(g_cuda_dll, "cuDevicePrimaryCtxRelease", nullptr));
     NVOF_RESOLVE(p_cuCtxSetCurrent, cuCtxSetCurrent_fn, "cuCtxSetCurrent", nullptr);
     NVOF_RESOLVE(p_cuCtxGetCurrent, cuCtxGetCurrent_fn, "cuCtxGetCurrent", nullptr);
     NVOF_RESOLVE(p_cuGetErrorString, cuGetErrorString_fn, "cuGetErrorString", nullptr);
@@ -467,8 +468,8 @@ void teardown_all_locked()
     {
         if (p_cuCtxSetCurrent != nullptr)
             p_cuCtxSetCurrent(nullptr);
-        if (p_cuDevicePrimaryCtxRelease != nullptr)
-            p_cuDevicePrimaryCtxRelease(g_cu_device);
+        if (p_cuCtxDestroy != nullptr)
+            p_cuCtxDestroy(g_cu_ctx);
         g_cu_ctx = nullptr;
         g_cu_device = 0;
     }
@@ -507,7 +508,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         // (spec: field only considered when enableExternalHints set).
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
-        init.perfLevel = NV_OF_PERF_LEVEL_FAST;
+        init.perfLevel = NV_OF_PERF_LEVEL_SLOW; // FAST never verified on Ada
         init.enableExternalHints = NV_OF_FALSE;
         init.enableOutputCost = NV_OF_FALSE; // v1: pure vectors, no cost plane
         init.hPrivData = nullptr;
@@ -669,7 +670,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali12] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF,inGRAY8) caps %u-%u x %u-%u "
+                 "[dali13] session %ux%u init(grid4,hintUndef,noExt,noCost,SLOW,OF,inGRAY8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
                  w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
@@ -713,7 +714,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali12] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali13] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -986,23 +987,17 @@ static void on_init_device(device *device)
         return;
     }
 
-    // Primary context (OpenCV-runtime/DALI convention): both proven stacks run
-    // NvOF on the retained primary, never on a fresh cuCtxCreate context.
+    // Fresh owned context (primary proved unusable for direct CUDA calls in
+    // this process: attach ok, first memcpy -> CU 201). Revert + test SLOW.
     CUcontext ctx = nullptr;
-    cu = p_cuDevicePrimaryCtxRetain(&ctx, static_cast<CUdevice>(matched));
+    cu = p_cuCtxCreate(&ctx, 0 /* CU_CTX_SCHED_AUTO */, static_cast<CUdevice>(matched));
     if (cu != CUDA_SUCCESS || ctx == nullptr)
     {
         set_status_locked(cuda_error_text(cu).c_str(), reshade::log::level::warning);
         return;
     }
-    if (p_cuCtxSetCurrent(ctx) != CUDA_SUCCESS)
-    {
-        set_status_locked("primary ctx retained but set-current failed", reshade::log::level::warning);
-        p_cuDevicePrimaryCtxRelease(static_cast<CUdevice>(matched));
-        return;
-    }
     g_cu_ctx = ctx;
-    g_cu_device = static_cast<CUdevice>(matched);
+    g_cu_device = 0;
 
     if (g_nvof_dll == nullptr)
     {
@@ -1173,7 +1168,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             {
                 sc_logged++;
                 char buf[128] = {};
-                snprintf(buf, sizeof(buf), "[dali12] frame set-current FAILED: %d (ctx=%p)",
+                snprintf(buf, sizeof(buf), "[dali13] frame set-current FAILED: %d (ctx=%p)",
                          static_cast<int>(sc), g_cu_ctx);
                 dbglog(buf);
             }
@@ -1225,7 +1220,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             xfer_logged++;
             char buf[192] = {};
             snprintf(buf, sizeof(buf),
-                     "[dali12] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
+                     "[dali13] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
                      static_cast<unsigned long long>(m.dstDevice), g_stream);
             dbglog(buf);
         }
@@ -1280,7 +1275,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali12] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali13] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1317,7 +1312,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali12] first execute OK: grid %ux%u outPitch %u",
+                    snprintf(buf, sizeof(buf), "[dali13] first execute OK: grid %ux%u outPitch %u",
                              g_grid_w, g_grid_h, g_out_pitch);
                     dbglog(buf);
                 }
@@ -1515,7 +1510,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali12]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali13]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
