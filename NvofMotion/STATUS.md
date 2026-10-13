@@ -121,17 +121,14 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali16]` (still OF5): stock input order, no change.
 - Current test build `[dali17]` (still OF5): exact stock default recipe
   (CUARRAY + MEDIUM + SetIO-nulls) fails identically – params exonerated.
-- PROBE VERDICT: **PASS** on the rig (apiVer 0x50, driver maxApiVer 0x50,
-  RTX 4080): execute 0 + center vec exactly +8.00px on 640x480 AND
-  3440x1440. Driver 617.14 exonerated, NVOFA healthy. It is OUR
-  process/config, not params (recipe identical) and not the driver.
-- Last remaining config diff probe-vs-addon: probe uses EXACT session dims,
-  addon pads to 128x32 (dali5+). (Pre-padding builds failed too, but those
-  were 2.0-era – never isolated under 5.0.)
-- Current test build `[dali19]` = exact session dims (no padding), rest =
-  `[dali18]`. If it passes, padding was the trigger.
-- If `[dali19]` still OF5: pivot to the native D3D12 NvOF interface
-  (5.0 headers HAVE nvOpticalFlowD3D12.h – same process, no CUDA).
+- Current test build `[dali19]` (still OF5): exact dims, no change.
+- Last process diff probe-vs-addon: probe runs single-threaded, addon
+  inits on one thread and executes on the game thread (with
+  attach/detach cycling). Probe now has CASE-THREADED (bring-up on main
+  + detach, frame on worker + detach – addon discipline). Run probe only
+  (fast, no game): worker OF5 = threading/context-migration trigger
+  (fix = push/pop discipline or per-thread attach in addon); worker
+  PASS = D3D12-active-GPU theory, pivot to native D3D12 NvOF.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
