@@ -164,7 +164,7 @@ void check_ctx_locked(const char *where)
     {
         logged++;
         char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali11] CTX %s: get=%d cur=%p expected=%p", where,
+        snprintf(buf, sizeof(buf), "[dali12] CTX %s: get=%d cur=%p expected=%p", where,
                  static_cast<int>(g), cur, g_cu_ctx);
         dbglog(buf);
     }
@@ -669,7 +669,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali11] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF,inGRAY8) caps %u-%u x %u-%u "
+                 "[dali12] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF,inGRAY8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
                  w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
@@ -713,7 +713,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali11] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali12] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1168,6 +1168,15 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         const CUresult sc = p_cuCtxSetCurrent(g_cu_ctx);
         if (sc != CUDA_SUCCESS)
         {
+            static int sc_logged = 0;
+            if (sc_logged < 3)
+            {
+                sc_logged++;
+                char buf[128] = {};
+                snprintf(buf, sizeof(buf), "[dali12] frame set-current FAILED: %d (ctx=%p)",
+                         static_cast<int>(sc), g_cu_ctx);
+                dbglog(buf);
+            }
             g_last_cu_code = static_cast<int>(sc);
             set_status_locked(cuda_error_text(sc).c_str(), reshade::log::level::warning);
             return;
@@ -1209,6 +1218,18 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         cu = p_cuMemcpy2DAsync(&m, g_stream);
     if (cu == CUDA_SUCCESS)
         cu = p_cuStreamSynchronize(g_stream);
+    {
+        static int xfer_logged = 0;
+        if (cu != CUDA_SUCCESS && xfer_logged < 3)
+        {
+            xfer_logged++;
+            char buf[192] = {};
+            snprintf(buf, sizeof(buf),
+                     "[dali12] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
+                     static_cast<unsigned long long>(m.dstDevice), g_stream);
+            dbglog(buf);
+        }
+    }
     // Cheap liveness proof: sampled checksum of the captured pixels.
     uint64_t sum = 0;
     if (cu == CUDA_SUCCESS)
@@ -1259,7 +1280,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali11] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali12] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1296,7 +1317,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali11] first execute OK: grid %ux%u outPitch %u",
+                    snprintf(buf, sizeof(buf), "[dali12] first execute OK: grid %ux%u outPitch %u",
                              g_grid_w, g_grid_h, g_out_pitch);
                     dbglog(buf);
                 }
@@ -1494,7 +1515,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali11]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali12]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))

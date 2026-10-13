@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali11]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali12]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -88,9 +88,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali10]` (INCONCLUSIVE + new symptom): session builds
   fine on the primary ctx (new 0xC0D... pointers), but per-frame fails with
   CU 201 (INVALID_CONTEXT), memcpys 0 – execute never reached.
-- Current test build `[dali11]` = ctx diagnostics only (still primary ctx):
-  `cuCtxGetCurrent` stickiness check (`CTX build`/`CTX frame` in debug log)
-  + loud set-current failures. This pinpoints WHERE the 201 comes from.
+- Current test build `[dali11]` (diagnostics): no CTX mismatch lines at build
+  (primary attach works), frame fails CU 201 before any CTX check-in – the
+  201 comes from frame set-current or the first xfer, not from execute.
+  `Scene activity: no` is expected fallout (no upload → no checksum).
+- Current test build `[dali12]` = pinpoint logging: `frame set-current
+  FAILED` vs `frame xfer FAILED` lines (first 3 each) with codes/handles.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
