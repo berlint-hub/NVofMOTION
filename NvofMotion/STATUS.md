@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-8]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-9]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -164,14 +164,17 @@ buffer – impossible on PCSX2, PS2-era games have none).
   goes sluggish/unresponsive; with OFF the vectors track the game.
   (Synth self-test read ~0.06 – pattern-specific FAST/grid4 quirk or mixed
   frames, irrelevant now that game content tracks.)
-- Mystery of the "freeze" SOLVED by the user: ReShade effects toggle OFF
-  stops `begin_effects` -> addon idle -> overlay frozen. (Follow-up: show
-  an "effects disabled" hint in the overlay when detectable.)
-  Current `[d3d12-5]` screenshot: frames 1822, executes 1821, avg 21.89px /
-  86.1% – healthy gameplay tracking.
-- Current test build `[d3d12-8]` = stronger synth pattern (8px checker
-  ±80, FAST-trackable) so the self-test is meaningful; rest = `[d3d12-7]`
-  winner config. Skip d3d12-6 (bug back).
+- Post-mortem freeze saga: user re-tested `[d3d12-3]` (temporal ON) –
+  HEALTHY (avg 36.54px / 12.8% localized). So temporal ON works fine;
+  the divergence theory is RETRACTED (corner excursions were real
+  motion). The "freeze" = ReShade effects toggle OFF (no begin_effects,
+  addon idle, overlay stale) + wrong scale 0.624 + static scenes.
+  Both ON and OFF track; canonical = ON (stock/guide default, hints help
+  video). Synth-0.06 question stays open (pattern too smooth for FAST?),
+  minor.
+- Current test build `[d3d12-9]` = temporal ON + synth toggle (strong
+  pattern) + telemetry + grid4/FAST. Phase 2b effectively DONE pending
+  visual check; next phase 2c consumer.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
