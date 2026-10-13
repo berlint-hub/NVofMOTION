@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-7]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-8]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -164,10 +164,14 @@ buffer – impossible on PCSX2, PS2-era games have none).
   goes sluggish/unresponsive; with OFF the vectors track the game.
   (Synth self-test read ~0.06 – pattern-specific FAST/grid4 quirk or mixed
   frames, irrelevant now that game content tracks.)
-- Current test build `[d3d12-7]` = locks in the winner: temporal OFF,
-  synth toggle kept, grid4/FAST/R8/noExt/noCost/input-older. Skip d3d12-6.
-  NEXT: phase 2c consumer (`MotionVectors` binding already updates every
-  frame) + visual check.
+- Mystery of the "freeze" SOLVED by the user: ReShade effects toggle OFF
+  stops `begin_effects` -> addon idle -> overlay frozen. (Follow-up: show
+  an "effects disabled" hint in the overlay when detectable.)
+  Current `[d3d12-5]` screenshot: frames 1822, executes 1821, avg 21.89px /
+  86.1% – healthy gameplay tracking.
+- Current test build `[d3d12-8]` = stronger synth pattern (8px checker
+  ±80, FAST-trackable) so the self-test is meaningful; rest = `[d3d12-7]`
+  winner config. Skip d3d12-6 (bug back).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
