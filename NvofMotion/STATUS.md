@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali5]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali6]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -71,13 +71,14 @@ buffer – impossible on PCSX2, PS2-era games have none).
   `disableTemporalHints = TRUE`. Temporal theory ruled out.
 - Current test build `[dali4]` (still OF5, frames 132): CUDEVICEPTR +
   stride, ABGR8 kept. Buffer-type theory ruled out.
-- Current test build `[dali5]` = session+buffers padded to 128x32
-  (3440 % 32 = 16 was never tested; upload stays a real-size subregion,
-  right strip is garbage by design) + `nvof_motion_debug.log` next to the
-  addon (build/session/caps/pitches/handles, first 5 exec failures, first
-  success). If this passes, HW alignment was the INVALID_PARAM trigger.
-- If `[dali5]` still OF5, attach the debug log + next: input/reference order
-  swap, then `apiVer`.
+- Current test build `[dali5]` (still OF5): 128x32 padding (3456x1440)
+  did NOT help – alignment ruled out. Debug log proved pitches/handles sane
+  (in pitch 13824 = tight, out pitch 3584 = driver-padded, handles alternate
+  correctly) and that failure is size-independent (1718x1294 fails too).
+- Current test build `[dali6]` = input/reference swapped (OpenCV convention
+  `calc(current, previous)`). Debug log stays.
+- If `[dali6]` still OF5, next: skip SetIO (driver default streams), then
+  `apiVer` (SDK 5.x headers).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

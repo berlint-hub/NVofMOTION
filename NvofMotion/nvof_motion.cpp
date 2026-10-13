@@ -633,7 +633,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali5] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF) caps %u-%u x %u-%u "
+                 "[dali6] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
                  w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
@@ -669,7 +669,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali5] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali6] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1149,8 +1149,9 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         const int just_filled = static_cast<int>(g_frames_captured % 2);
         // DALI-faithful: zero-init only (no ROI, no hints flags).
         NV_OF_EXECUTE_INPUT_PARAMS in_params = {};
-        in_params.inputFrame = g_input_bufs[1 - just_filled];
-        in_params.referenceFrame = g_input_bufs[just_filled];
+        // OpenCV convention (calc(current, previous)): input = current frame.
+        in_params.inputFrame = g_input_bufs[just_filled];
+        in_params.referenceFrame = g_input_bufs[1 - just_filled];
         // Bisect temporal state: disabled (DALI/OpenCV default path).
         in_params.disableTemporalHints = NV_OF_TRUE;
         NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
@@ -1174,7 +1175,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali5] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali6] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1211,7 +1212,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali5] first execute OK: grid %ux%u outPitch %u",
+                    snprintf(buf, sizeof(buf), "[dali6] first execute OK: grid %ux%u outPitch %u",
                              g_grid_w, g_grid_h, g_out_pitch);
                     dbglog(buf);
                 }
@@ -1409,7 +1410,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali5]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali6]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
