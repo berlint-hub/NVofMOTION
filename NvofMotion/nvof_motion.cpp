@@ -35,81 +35,27 @@
 #include <imgui.h>
 #include <reshade.hpp>
 
-#include <cuda.h> // CUDA toolkit headers only (types); no cuda.lib linkage
-
-#include "nvOpticalFlowCommon.h" // NVIDIAOpticalFlowSDK checkout (BSD)
-#include "nvOpticalFlowCuda.h"
-
-// NOTE: flow_ptx.h (convert kernel, built by CMake) is currently unused:
-// output is read as CUDEVICEPTR + converted on CPU. Kept for a future fast path.
+#include "nvOpticalFlowCommon.h" // mbucchia/Optical-Flow-SDK NvOFInterface (API 5.0)
+#include "nvOpticalFlowD3D12.h"
 
 using namespace reshade;
 using namespace reshade::api;
 
-// ---- explicit CUDA driver-API imports (no import lib needed) ----
-using cuInit_fn = CUresult(CUDAAPI *)(unsigned int);
-using cuDeviceGetCount_fn = CUresult(CUDAAPI *)(int *);
-using cuDeviceGet_fn = CUresult(CUDAAPI *)(CUdevice *, int);
-using cuDeviceGetLuid_fn = CUresult(CUDAAPI *)(char *, unsigned int *, CUdevice);
-using cuCtxCreate_fn = CUresult(CUDAAPI *)(CUcontext *, unsigned int, CUdevice);
-using cuCtxDestroy_fn = CUresult(CUDAAPI *)(CUcontext);
-using cuDevicePrimaryCtxRetain_fn = CUresult(CUDAAPI *)(CUcontext *, CUdevice);
-using cuDevicePrimaryCtxRelease_fn = CUresult(CUDAAPI *)(CUdevice);
-using cuCtxSetCurrent_fn = CUresult(CUDAAPI *)(CUcontext);
-using cuCtxGetCurrent_fn = CUresult(CUDAAPI *)(CUcontext *);
-using cuGetErrorString_fn = CUresult(CUDAAPI *)(CUresult, const char **);
-using cuStreamCreate_fn = CUresult(CUDAAPI *)(CUstream *, unsigned int);
-using cuStreamDestroy_fn = CUresult(CUDAAPI *)(CUstream);
-using cuStreamSynchronize_fn = CUresult(CUDAAPI *)(CUstream);
-using cuMemcpy2DAsync_fn = CUresult(CUDAAPI *)(const CUDA_MEMCPY2D *, CUstream);
-using cuMemAlloc_fn = CUresult(CUDAAPI *)(CUdeviceptr *, size_t);
-using cuMemFree_fn = CUresult(CUDAAPI *)(CUdeviceptr);
-using cuModuleLoadData_fn = CUresult(CUDAAPI *)(CUmodule *, const void *);
-using cuModuleGetFunction_fn = CUresult(CUDAAPI *)(CUfunction *, CUmodule, const char *);
-using cuModuleUnload_fn = CUresult(CUDAAPI *)(CUmodule);
-using cuLaunchKernel_fn = CUresult(CUDAAPI *)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, unsigned int, CUstream, void **, void **);
-
-using NvOFCreateInstance_fn =
-    NV_OF_STATUS(NVOFAPI *)(uint32_t, NV_OF_CUDA_API_FUNCTION_LIST *);
+// ---- explicit NvOF D3D12 imports (nvofapi64.dll, no import lib needed) ----
+using NvOFCreateInstanceD3D12_fn = NV_OF_STATUS(NVOFAPI *)(uint32_t, NV_OF_D3D12_API_FUNCTION_LIST *);
 
 namespace {
 
 std::mutex g_mutex;
 
-HMODULE g_cuda_dll = nullptr;
 HMODULE g_nvof_dll = nullptr;
-
-cuInit_fn p_cuInit = nullptr;
-cuDeviceGetCount_fn p_cuDeviceGetCount = nullptr;
-cuDeviceGet_fn p_cuDeviceGet = nullptr;
-cuDeviceGetLuid_fn p_cuDeviceGetLuid = nullptr;
-cuCtxCreate_fn p_cuCtxCreate = nullptr;
-cuCtxDestroy_fn p_cuCtxDestroy = nullptr;
-cuDevicePrimaryCtxRetain_fn p_cuDevicePrimaryCtxRetain = nullptr;
-cuDevicePrimaryCtxRelease_fn p_cuDevicePrimaryCtxRelease = nullptr;
-cuCtxSetCurrent_fn p_cuCtxSetCurrent = nullptr;
-cuCtxGetCurrent_fn p_cuCtxGetCurrent = nullptr;
-cuGetErrorString_fn p_cuGetErrorString = nullptr;
-cuStreamCreate_fn p_cuStreamCreate = nullptr;
-cuStreamDestroy_fn p_cuStreamDestroy = nullptr;
-cuStreamSynchronize_fn p_cuStreamSynchronize = nullptr;
-cuMemcpy2DAsync_fn p_cuMemcpy2DAsync = nullptr;
-cuMemAlloc_fn p_cuMemAlloc = nullptr;
-cuMemFree_fn p_cuMemFree = nullptr;
-cuModuleLoadData_fn p_cuModuleLoadData = nullptr;
-cuModuleGetFunction_fn p_cuModuleGetFunction = nullptr;
-cuModuleUnload_fn p_cuModuleUnload = nullptr;
-cuLaunchKernel_fn p_cuLaunchKernel = nullptr;
-
-NvOFCreateInstance_fn p_NvOFCreateInstanceCuda = nullptr;
-NV_OF_CUDA_API_FUNCTION_LIST g_of = {};
+NvOFCreateInstanceD3D12_fn p_NvOFCreateInstanceD3D12 = nullptr;
+NV_OF_D3D12_API_FUNCTION_LIST g_of12 = {};
 NvOFHandle g_of_handle = nullptr;
 
-CUcontext g_cu_ctx = nullptr;
-CUdevice g_cu_device = 0; // for primary-ctx release
-// Bisect output grid size (caps: 1 2 4). kOutGrid=1 = densest, simplest HW path.
+// Grid for the D3D12 bring-up (caps list 1 2 4).
 constexpr uint32_t kOutGrid = 1;
-ID3D12Device *g_owner_device = nullptr; // device owning ctx + pipeline
+ID3D12Device *g_owner_device = nullptr; // game device owning the NvOF session
 device *g_api_dev = nullptr;            // for create/destroy of ReShade resources
 bool g_session_active = false;
 
@@ -153,32 +99,12 @@ void dbglog(const char *line)
     fclose(f);
 }
 
-// Verifies the expected ctx is actually current (stickiness check).
-// Logs first 3 mismatches; callable from anywhere (own log mutex).
-void check_ctx_locked(const char *where)
-{
-    static int logged = 0;
-    if (p_cuCtxGetCurrent == nullptr || logged >= 3)
-        return;
-    CUcontext cur = nullptr;
-    const CUresult g = p_cuCtxGetCurrent(&cur);
-    if (g != CUDA_SUCCESS || cur != g_cu_ctx)
-    {
-        logged++;
-        char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali19] CTX %s: get=%d cur=%p expected=%p", where,
-                 static_cast<int>(g), cur, g_cu_ctx);
-        dbglog(buf);
-    }
-}
-
 // ---- frame pipeline (all guarded by g_mutex) ----
 ID3D12CommandAllocator *g_cmd_alloc = nullptr;
 ID3D12GraphicsCommandList *g_cmd_list = nullptr;
 ID3D12Fence *g_fence = nullptr;
 uint64_t g_fence_value = 0;
 HANDLE g_frame_event = nullptr; // signaled when the copy of a frame is done
-CUstream g_stream = nullptr;
 
 // Single CPU-visible readback buffer + persistent mapping + copy footprint.
 ID3D12Resource *g_readback = nullptr;
@@ -192,19 +118,26 @@ uint64_t g_skips = 0;
 
 uint32_t g_frame_w = 0, g_frame_h = 0;
 
-// Stock default recipe (AppOFCuda main defaults): CUARRAY buffers.
-NvOFGPUBufferHandle g_input_bufs[2] = { nullptr, nullptr };
-CUarray g_input_arrays[2] = { nullptr, nullptr };
+// ---- NvOF D3D12 registered resources (no CUDA) ----
+NvOFGPUBufferHandle g_in_bufs[2] = { nullptr, nullptr };
+ID3D12Resource *g_in_res[2] = { nullptr, nullptr }; // DEFAULT R8_UNORM WxH
+ID3D12Resource *g_in_up[2] = { nullptr, nullptr }; // UPLOAD staging (byte buffers)
+void *g_in_up_ptr[2] = { nullptr, nullptr };       // persistent maps
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_in_foot[2] = {}; // footprint of R8 inputs
 std::vector<uint8_t> g_gray; // RGBA->luma staging (session-pitched rows)
 uint32_t g_gray_pitch = 0;
 
 // ---- phase 2b: execute output + conversion + exposure ----
 NvOFGPUBufferHandle g_out_buf = nullptr;
-CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
-std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
-NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
-CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
-CUfunction g_convert_fn = nullptr; // (teardown stays null-safe)
+ID3D12Resource *g_out_res = nullptr; // DEFAULT R16G16_SINT grid
+ID3D12Resource *g_out_down = nullptr; // READBACK staging
+void *g_out_down_ptr = nullptr;      // persistent map
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_out_foot = {};
+ID3D12Fence *g_app_fence = nullptr; // upload-complete (app side)
+uint64_t g_app_val = 0;
+ID3D12Fence *g_ofa_fence = nullptr; // exec-complete (NVOFA side)
+uint64_t g_ofa_val = 0;
+std::vector<int16_t> g_of_cpu; // int16 pairs staging for convert
 uint32_t g_grid_w = 0, g_grid_h = 0;
 // R16G16F output texture (ReShade-owned) + CPU upload staging (native).
 resource g_out_tex = { 0 };
@@ -225,7 +158,6 @@ uint64_t g_executes = 0;
 
 uint64_t g_frames_captured = 0;
 uint64_t g_memcpys_done = 0;
-int g_last_cu_code = 0;
 int g_last_of_code = 0;
 std::string g_last_of_error; // nvOFGetLastError text for the last execute failure
 // SEH forensics: which bring-up stage crashed + exception code (0 = no crash).
@@ -246,21 +178,17 @@ void set_status_locked(const char *text, reshade::log::level level)
     reshade::log::message(level, text);
 }
 
-std::string cuda_error_text(CUresult res)
+// Blocking CPU wait on a fence value (stock AppOFD3D12 pattern).
+void wait_fence_value(ID3D12Fence *fence, uint64_t value)
 {
-    const char *str = nullptr;
-    if (p_cuGetErrorString != nullptr && p_cuGetErrorString(res, &str) == CUDA_SUCCESS && str != nullptr)
-        return str;
-    return "CUDA error " + std::to_string(static_cast<int>(res));
-}
-
-// Records the numeric code (shown in overlay) plus a readable status line.
-void set_cu_status_locked(const char *what, CUresult cu)
-{
-    g_last_cu_code = static_cast<int>(cu);
-    const std::string msg =
-        std::string(what) + " (CU " + std::to_string(static_cast<int>(cu)) + ": " + cuda_error_text(cu) + ")";
-    set_status_locked(msg.c_str(), reshade::log::level::warning);
+    if (fence == nullptr || fence->GetCompletedValue() >= value)
+        return;
+    HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (ev == nullptr)
+        return;
+    if (SUCCEEDED(fence->SetEventOnCompletion(value, ev)))
+        WaitForSingleObject(ev, INFINITE);
+    CloseHandle(ev);
 }
 
 // Round-nearest-ish float -> IEEE half bits (for R16G16F upload staging).
@@ -288,94 +216,102 @@ static uint16_t float_to_half(float v)
     return static_cast<uint16_t>(sign | half);
 }
 
-// Tries primary symbol name, then fallback (driver exports vary by version).
-FARPROC load_sym(HMODULE mod, const char *primary, const char *fallback = nullptr)
+// Loads nvofapi64.dll + resolves the D3D12 entry point (no CUDA involved).
+bool resolve_nvof_locked()
 {
-    if (FARPROC p = GetProcAddress(mod, primary))
-        return p;
-    if (fallback != nullptr)
-        return GetProcAddress(mod, fallback);
-    return nullptr;
-}
-
-bool resolve_cuda_symbols_locked()
-{
-    if (g_cuda_dll == nullptr)
+    if (g_nvof_dll == nullptr)
     {
-        g_cuda_dll = LoadLibraryW(L"nvcuda.dll");
-        if (g_cuda_dll == nullptr)
+        g_nvof_dll = LoadLibraryW(L"nvofapi64.dll");
+        if (g_nvof_dll == nullptr)
         {
-            set_status_locked("nvcuda.dll NOT found - no CUDA driver, staying idle", reshade::log::level::warning);
+            set_status_locked("nvofapi64.dll NOT found - no NVIDIA driver, staying idle",
+                              reshade::log::level::warning);
             return false;
         }
     }
-#define NVOF_RESOLVE(var, type, prim, fb)                                     \
-    var = reinterpret_cast<type>(load_sym(g_cuda_dll, prim, fb));             \
-    if (var == nullptr)                                                       \
-    {                                                                         \
-        set_status_locked("nvcuda.dll present but " prim " missing", reshade::log::level::warning); \
-        return false;                                                         \
+    if (p_NvOFCreateInstanceD3D12 == nullptr)
+    {
+        p_NvOFCreateInstanceD3D12 = reinterpret_cast<NvOFCreateInstanceD3D12_fn>(
+            GetProcAddress(g_nvof_dll, "NvOFAPICreateInstanceD3D12"));
+        if (p_NvOFCreateInstanceD3D12 == nullptr)
+        {
+            set_status_locked("nvofapi64.dll present but NvOFAPICreateInstanceD3D12 missing",
+                              reshade::log::level::warning);
+            return false;
+        }
     }
-    NVOF_RESOLVE(p_cuInit, cuInit_fn, "cuInit", nullptr);
-    NVOF_RESOLVE(p_cuDeviceGetCount, cuDeviceGetCount_fn, "cuDeviceGetCount", nullptr);
-    NVOF_RESOLVE(p_cuDeviceGet, cuDeviceGet_fn, "cuDeviceGet", nullptr);
-    NVOF_RESOLVE(p_cuDeviceGetLuid, cuDeviceGetLuid_fn, "cuDeviceGetLuid", nullptr);
-    NVOF_RESOLVE(p_cuCtxCreate, cuCtxCreate_fn, "cuCtxCreate", "cuCtxCreate_v2");
-    NVOF_RESOLVE(p_cuCtxDestroy, cuCtxDestroy_fn, "cuCtxDestroy", "cuCtxDestroy_v2");
-    // Optional (primary-ctx experiment): must NOT fail bring-up when missing.
-    p_cuDevicePrimaryCtxRetain = reinterpret_cast<cuDevicePrimaryCtxRetain_fn>(
-        load_sym(g_cuda_dll, "cuDevicePrimaryCtxRetain", nullptr));
-    p_cuDevicePrimaryCtxRelease = reinterpret_cast<cuDevicePrimaryCtxRelease_fn>(
-        load_sym(g_cuda_dll, "cuDevicePrimaryCtxRelease", nullptr));
-    NVOF_RESOLVE(p_cuCtxSetCurrent, cuCtxSetCurrent_fn, "cuCtxSetCurrent", nullptr);
-    NVOF_RESOLVE(p_cuCtxGetCurrent, cuCtxGetCurrent_fn, "cuCtxGetCurrent", nullptr);
-    NVOF_RESOLVE(p_cuGetErrorString, cuGetErrorString_fn, "cuGetErrorString", nullptr);
-    NVOF_RESOLVE(p_cuStreamCreate, cuStreamCreate_fn, "cuStreamCreate", nullptr);
-    NVOF_RESOLVE(p_cuStreamDestroy, cuStreamDestroy_fn, "cuStreamDestroy", nullptr);
-    NVOF_RESOLVE(p_cuStreamSynchronize, cuStreamSynchronize_fn, "cuStreamSynchronize", nullptr);
-    NVOF_RESOLVE(p_cuMemcpy2DAsync, cuMemcpy2DAsync_fn, "cuMemcpy2DAsync", "cuMemcpy2DAsync_v2");
-    NVOF_RESOLVE(p_cuMemAlloc, cuMemAlloc_fn, "cuMemAlloc", "cuMemAlloc_v2");
-    NVOF_RESOLVE(p_cuMemFree, cuMemFree_fn, "cuMemFree", "cuMemFree_v2");
-    NVOF_RESOLVE(p_cuModuleLoadData, cuModuleLoadData_fn, "cuModuleLoadData", nullptr);
-    NVOF_RESOLVE(p_cuModuleGetFunction, cuModuleGetFunction_fn, "cuModuleGetFunction", nullptr);
-    NVOF_RESOLVE(p_cuModuleUnload, cuModuleUnload_fn, "cuModuleUnload", nullptr);
-    NVOF_RESOLVE(p_cuLaunchKernel, cuLaunchKernel_fn, "cuLaunchKernel", nullptr);
-#undef NVOF_RESOLVE
     return true;
 }
 
-// Destroys NvOF session + input buffers, keeps CUDA context. ctx must be current.
+// Destroys NvOF session (unregister first!) + D3D12 resources + NvOF fences.
 void destroy_of_locked()
 {
     for (int i = 0; i < 2; ++i)
     {
-        if (g_input_bufs[i] != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
-            g_of.nvOFDestroyGPUBufferCuda(g_input_bufs[i]);
-        g_input_bufs[i] = nullptr;
-        g_input_arrays[i] = nullptr;
+        if (g_in_bufs[i] != nullptr && g_of12.nvOFUnregisterResourceD3D12 != nullptr)
+        {
+            NV_OF_UNREGISTER_RESOURCE_PARAMS_D3D12 up = {};
+            up.hOFGpuBuffer = g_in_bufs[i];
+            g_of12.nvOFUnregisterResourceD3D12(&up);
+        }
+        g_in_bufs[i] = nullptr;
+        if (g_in_res[i] != nullptr)
+        {
+            g_in_res[i]->Release();
+            g_in_res[i] = nullptr;
+        }
+        if (g_in_up[i] != nullptr)
+        {
+            g_in_up[i]->Unmap(0, nullptr);
+            g_in_up[i]->Release();
+            g_in_up[i] = nullptr;
+        }
+        g_in_up_ptr[i] = nullptr;
     }
-    if (g_out_buf != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
-        g_of.nvOFDestroyGPUBufferCuda(g_out_buf);
-    g_out_buf = nullptr;
-    g_out_array = nullptr;
-    if (g_of_handle != nullptr && g_of.nvOFDestroy != nullptr)
+    if (g_out_buf != nullptr && g_of12.nvOFUnregisterResourceD3D12 != nullptr)
     {
-        g_of.nvOFDestroy(g_of_handle);
+        NV_OF_UNREGISTER_RESOURCE_PARAMS_D3D12 up = {};
+        up.hOFGpuBuffer = g_out_buf;
+        g_of12.nvOFUnregisterResourceD3D12(&up);
+    }
+    g_out_buf = nullptr;
+    if (g_out_res != nullptr)
+    {
+        g_out_res->Release();
+        g_out_res = nullptr;
+    }
+    if (g_out_down != nullptr)
+    {
+        g_out_down->Unmap(0, nullptr);
+        g_out_down->Release();
+        g_out_down = nullptr;
+    }
+    g_out_down_ptr = nullptr;
+    if (g_app_fence != nullptr)
+    {
+        g_app_fence->Release();
+        g_app_fence = nullptr;
+    }
+    g_app_val = 0;
+    if (g_ofa_fence != nullptr)
+    {
+        g_ofa_fence->Release();
+        g_ofa_fence = nullptr;
+    }
+    g_ofa_val = 0;
+    if (g_of_handle != nullptr && g_of12.nvOFDestroy != nullptr)
+    {
+        g_of12.nvOFDestroy(g_of_handle);
         g_of_handle = nullptr;
     }
     g_session_active = false;
     g_caps_ok = false;
 }
 
-// Drops readback buffer + session/inputs (+ linear scratch). Keeps ctx,
-// table, DLLs and size-independent objects (list/alloc/fence/event/stream).
+// Drops readback buffer + session/inputs (+ linear scratch).
 // Output texture/SRV are destroyed only when gpu_idle (GPU may sample them).
-// Manages ctx itself.
 void teardown_pipeline_locked(bool gpu_idle)
 {
-    if (g_cu_ctx != nullptr && p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(g_cu_ctx);
-
     destroy_of_locked();
 
     g_of_cpu.clear();
@@ -411,35 +347,13 @@ void teardown_pipeline_locked(bool gpu_idle)
     g_out_ready = false;
     g_grid_w = g_grid_h = 0;
     g_frame_w = g_frame_h = 0;
-
-    if (p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(nullptr);
 }
 
-// Full teardown incl. CUDA context. Safe to call with partial state.
+// Full teardown incl. NvOF fences/DLL state. Safe to call with partial state.
 void teardown_all_locked()
 {
-    if (g_cu_ctx != nullptr && p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(g_cu_ctx);
-
     teardown_pipeline_locked(false); // no drain here: leak cb texture
 
-    // teardown_pipeline_locked detached; re-attach for the work below.
-    if (g_cu_ctx != nullptr && p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(g_cu_ctx);
-
-    if (g_ptx_mod != nullptr && p_cuModuleUnload != nullptr)
-        p_cuModuleUnload(g_ptx_mod);
-    g_ptx_mod = nullptr;
-    g_convert_fn = nullptr;
-    if (g_stream != nullptr)
-    {
-        if (p_cuStreamSynchronize != nullptr)
-            p_cuStreamSynchronize(g_stream);
-        if (p_cuStreamDestroy != nullptr)
-            p_cuStreamDestroy(g_stream);
-        g_stream = nullptr;
-    }
     if (g_cmd_list != nullptr)
     {
         g_cmd_list->Release();
@@ -462,26 +376,18 @@ void teardown_all_locked()
     }
     g_fence_value = 0;
 
-    if (g_cu_ctx != nullptr)
-    {
-        if (p_cuCtxSetCurrent != nullptr)
-            p_cuCtxSetCurrent(nullptr);
-        if (p_cuCtxDestroy != nullptr)
-            p_cuCtxDestroy(g_cu_ctx);
-        g_cu_ctx = nullptr;
-        g_cu_device = 0;
-    }
     g_owner_device = nullptr;
     g_api_dev = nullptr;
 }
 
-// POD-only NvOF bring-up with SEH guard: any driver crash inside becomes a
-// reported status (stage + exception code) instead of a dead process.
-// Stages: 1 = create handle, 2 = init, 3/4 = input buffers, 5 = output.
+// POD-only NvOF D3D12 bring-up with SEH guard: any driver crash inside becomes
+// a reported status (stage + exception code) instead of a dead process.
+// Stages: 1 = create handle, 2 = init (+ formats), 3 = fences,
+// 4/5 = input resources, 6 = output resource.
 // Returns false on error or exception. On exception, handles are deliberately
 // leaked (never touch the driver again on that path); g_crashed_nvof is set.
 // NOTE: no unwindable locals in here (C2712) - POD and globals only.
-bool create_of_nvof_locked(uint32_t w, uint32_t h)
+bool create_of_nvof_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
     g_crash_stage = 0;
     g_crashed_nvof = false;
@@ -489,7 +395,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
     {
         g_crash_stage = 1;
         NvOFHandle hOf = nullptr;
-        NV_OF_STATUS st = g_of.nvCreateOpticalFlowCuda(g_cu_ctx, &hOf);
+        NV_OF_STATUS st = g_of12.nvCreateOpticalFlowD3D12(d3d12, &hOf);
         if (st != NV_OF_SUCCESS || hOf == nullptr)
         {
             g_last_of_code = static_cast<int>(st);
@@ -497,73 +403,233 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         }
         g_of_handle = hOf;
 
-        // Stock order (NvOFCudaAPI ctor): SetIO BEFORE init, unconditionally
-        // (AppOFCuda default = null streams).
-        st = g_of.nvOFSetIOCudaStreams(hOf, nullptr, nullptr);
-        if (st != NV_OF_SUCCESS)
-        {
-            g_last_of_code = static_cast<int>(st);
-            return false;
-        }
-
         g_crash_stage = 2;
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
         init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_1;
-        // OpenCV-faithful: hintGridSize UNDEFINED when external hints off
-        // (spec: field only considered when enableExternalHints set).
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
-        init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM; // stock AppOFCuda default
-        // 5.0 REQUIRED: input buffer format has no valid zero default.
+        init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM; // stock AppOFD3D12 default class
         init.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
-        // 5.0 predDirection/globalFlow stay 0 = FORWARD/off.
         init.enableExternalHints = NV_OF_FALSE;
-        init.enableOutputCost = NV_OF_FALSE; // v1: pure vectors, no cost plane
+        init.enableOutputCost = NV_OF_FALSE;
         init.hPrivData = nullptr;
 
-        st = g_of.nvOFInit(hOf, &init);
+        st = g_of12.nvOFInit(hOf, &init);
         if (st != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(st);
             return false;
         }
 
+        // Surface formats must include our R8 (gray in) + R16G16_SINT (flow out).
+        {
+            uint32_t n = 0;
+            if (g_of12.nvOFGetSurfaceFormatCountD3D12(hOf, NV_OF_BUFFER_USAGE_INPUT,
+                                                      NV_OF_MODE_OPTICALFLOW, &n) != NV_OF_SUCCESS ||
+                n == 0 || n > 16)
+            {
+                g_last_of_code = -1;
+                return false;
+            }
+            DXGI_FORMAT fmts[16] = {};
+            if (g_of12.nvOFGetSurfaceFormatD3D12(hOf, NV_OF_BUFFER_USAGE_INPUT, NV_OF_MODE_OPTICALFLOW,
+                                                fmts) != NV_OF_SUCCESS)
+            {
+                g_last_of_code = -2;
+                return false;
+            }
+            bool have_r8 = false;
+            for (uint32_t i = 0; i < n; ++i)
+                if (fmts[i] == DXGI_FORMAT_R8_UNORM)
+                    have_r8 = true;
+            if (!have_r8)
+            {
+                g_last_of_code = -3;
+                return false;
+            }
+        }
+        {
+            uint32_t n = 0;
+            if (g_of12.nvOFGetSurfaceFormatCountD3D12(hOf, NV_OF_BUFFER_USAGE_OUTPUT,
+                                                      NV_OF_MODE_OPTICALFLOW, &n) != NV_OF_SUCCESS ||
+                n == 0 || n > 16)
+            {
+                g_last_of_code = -4;
+                return false;
+            }
+            DXGI_FORMAT fmts[16] = {};
+            if (g_of12.nvOFGetSurfaceFormatD3D12(hOf, NV_OF_BUFFER_USAGE_OUTPUT, NV_OF_MODE_OPTICALFLOW,
+                                                fmts) != NV_OF_SUCCESS)
+            {
+                g_last_of_code = -5;
+                return false;
+            }
+            bool have_flow = false;
+            for (uint32_t i = 0; i < n; ++i)
+                if (fmts[i] == DXGI_FORMAT_R16G16_SINT)
+                    have_flow = true;
+            if (!have_flow)
+            {
+                g_last_of_code = -6;
+                return false;
+            }
+        }
+
+        g_crash_stage = 3;
+        if (FAILED(d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_app_fence))) ||
+            g_app_fence == nullptr ||
+            FAILED(d3d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_ofa_fence))) ||
+            g_ofa_fence == nullptr)
+        {
+            g_last_of_code = -7;
+            return false;
+        }
+        g_app_val = 0;
+        g_ofa_val = 0;
+
         for (int i = 0; i < 2; ++i)
         {
-            g_crash_stage = 3 + i;
-            NV_OF_BUFFER_DESCRIPTOR desc = {};
-            desc.width = w;
-            desc.height = h;
-            desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
-            desc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
-            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY,
-                                               &g_input_bufs[i]);
-            if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
+            g_crash_stage = 4 + i;
+            D3D12_RESOURCE_DESC td = {};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = w;
+            td.Height = h;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.Format = DXGI_FORMAT_R8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            if (FAILED(d3d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&g_in_res[i]))) ||
+                g_in_res[i] == nullptr)
+            {
+                g_last_of_code = -10 - i;
+                return false;
+            }
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+            UINT64 total = 0;
+            d3d12->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+            if (total == 0 || fp.Footprint.RowPitch == 0)
+            {
+                g_last_of_code = -20 - i;
+                return false;
+            }
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = total;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_PROPERTIES uhp = {};
+            uhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            uhp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            uhp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            void *mapped = nullptr;
+            if (FAILED(d3d12->CreateCommittedResource(&uhp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                      D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                      IID_PPV_ARGS(&g_in_up[i]))) ||
+                g_in_up[i] == nullptr || FAILED(g_in_up[i]->Map(0, nullptr, &mapped)) || mapped == nullptr)
+            {
+                g_last_of_code = -30 - i;
+                return false;
+            }
+            g_in_up_ptr[i] = mapped;
+            g_in_foot[i] = fp;
+            NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 rp = {};
+            rp.resource = g_in_res[i];
+            rp.inputFencePoint.fence = g_app_fence;
+            rp.inputFencePoint.value = 0;
+            rp.hOFGpuBuffer = &g_in_bufs[i];
+            rp.outputFencePoint.fence = g_ofa_fence;
+            rp.outputFencePoint.value = 0;
+            st = g_of12.nvOFRegisterResourceD3D12(hOf, &rp);
+            if (st != NV_OF_SUCCESS || g_in_bufs[i] == nullptr)
             {
                 g_last_of_code = static_cast<int>(st);
                 return false;
             }
-            g_input_arrays[i] = g_of.nvOFGPUBufferGetCUarray(g_input_bufs[i]);
-            if (g_input_arrays[i] == nullptr)
-                return false;
         }
-        g_crash_stage = 5;
-        NV_OF_BUFFER_DESCRIPTOR odesc = {};
-        odesc.width = (w + kOutGrid - 1) / kOutGrid; // ceil (OpenCV order)
-        odesc.height = (h + kOutGrid - 1) / kOutGrid;
-        odesc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
-        odesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
-        st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_out_buf);
-        if (st != NV_OF_SUCCESS || g_out_buf == nullptr)
+        g_crash_stage = 6;
         {
-            g_last_of_code = static_cast<int>(st);
-            return false;
+            const uint32_t gw = (w + kOutGrid - 1) / kOutGrid;
+            const uint32_t gh = (h + kOutGrid - 1) / kOutGrid;
+            D3D12_RESOURCE_DESC td = {};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = gw;
+            td.Height = gh;
+            td.DepthOrArraySize = 1;
+            td.MipLevels = 1;
+            td.Format = DXGI_FORMAT_R16G16_SINT;
+            td.SampleDesc.Count = 1;
+            td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            hp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            if (FAILED(d3d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                                                      D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                      IID_PPV_ARGS(&g_out_res))) ||
+                g_out_res == nullptr)
+            {
+                g_last_of_code = -40;
+                return false;
+            }
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+            UINT64 total = 0;
+            d3d12->GetCopyableFootprints(&td, 0, 1, 0, &fp, nullptr, nullptr, &total);
+            if (total == 0 || fp.Footprint.RowPitch == 0)
+            {
+                g_last_of_code = -41;
+                return false;
+            }
+            D3D12_RESOURCE_DESC bd = {};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = total;
+            bd.Height = 1;
+            bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1;
+            bd.Format = DXGI_FORMAT_UNKNOWN;
+            bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            D3D12_HEAP_PROPERTIES rhp = {};
+            rhp.Type = D3D12_HEAP_TYPE_READBACK;
+            rhp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            rhp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+            void *mapped = nullptr;
+            if (FAILED(d3d12->CreateCommittedResource(&rhp, D3D12_HEAP_FLAG_NONE, &bd,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                      IID_PPV_ARGS(&g_out_down))) ||
+                g_out_down == nullptr || FAILED(g_out_down->Map(0, nullptr, &mapped)) || mapped == nullptr)
+            {
+                g_last_of_code = -42;
+                return false;
+            }
+            g_out_down_ptr = mapped;
+            g_out_foot = fp;
+            NV_OF_REGISTER_RESOURCE_PARAMS_D3D12 rp = {};
+            rp.resource = g_out_res;
+            rp.inputFencePoint.fence = g_app_fence;
+            rp.inputFencePoint.value = 0;
+            rp.hOFGpuBuffer = &g_out_buf;
+            rp.outputFencePoint.fence = g_ofa_fence;
+            rp.outputFencePoint.value = 0;
+            st = g_of12.nvOFRegisterResourceD3D12(hOf, &rp);
+            if (st != NV_OF_SUCCESS || g_out_buf == nullptr)
+            {
+                g_last_of_code = static_cast<int>(st);
+                return false;
+            }
         }
-        g_out_array = g_of.nvOFGPUBufferGetCUarray(g_out_buf);
-        if (g_out_array == nullptr)
-            return false;
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -574,23 +640,31 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
     }
 }
 
-// (Re)builds NvOF session + buffers at W x H. ctx must be current.
-bool create_of_locked(uint32_t w, uint32_t h)
+// (Re)builds NvOF D3D12 session + registered resources at W x H.
+bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
     destroy_of_locked();
 
-    if (!create_of_nvof_locked(w, h))
+    if (!create_of_nvof_locked(d3d12, w, h))
     {
         if (g_crashed_nvof)
         {
             // Driver crashed mid-bring-up: leak handles on purpose, report it.
             g_of_handle = nullptr;
-            g_input_bufs[0] = nullptr;
-            g_input_bufs[1] = nullptr;
-            g_input_arrays[0] = nullptr;
-            g_input_arrays[1] = nullptr;
+            g_in_bufs[0] = nullptr;
+            g_in_bufs[1] = nullptr;
+            g_in_res[0] = nullptr;
+            g_in_res[1] = nullptr;
+            g_in_up[0] = nullptr;
+            g_in_up[1] = nullptr;
+            g_in_up_ptr[0] = nullptr;
+            g_in_up_ptr[1] = nullptr;
             g_out_buf = nullptr;
-            g_out_array = nullptr;
+            g_out_res = nullptr;
+            g_out_down = nullptr;
+            g_out_down_ptr = nullptr;
+            g_app_fence = nullptr;
+            g_ofa_fence = nullptr;
             char code[32] = {};
             snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned int>(g_last_of_code));
             const std::string msg = std::string("[NVOF Motion] DRIVER CRASH in bring-up (stage ") +
@@ -607,7 +681,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
     auto query_cap = [&](NV_OF_CAPS cap, uint32_t &out) {
         uint32_t val = 0;
         uint32_t size = sizeof(val);
-        if (g_of.nvOFGetCaps(g_of_handle, cap, &val, &size) == NV_OF_SUCCESS)
+        if (g_of12.nvOFGetCaps(g_of_handle, cap, &val, &size) == NV_OF_SUCCESS)
         {
             out = val;
             return true;
@@ -619,17 +693,17 @@ bool create_of_locked(uint32_t w, uint32_t h)
         query_cap(NV_OF_CAPS_HEIGHT_MIN, g_cap_hmin) &
         query_cap(NV_OF_CAPS_HEIGHT_MAX, g_cap_hmax);
     query_cap(NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, g_cap_grids);
-    // Two-stage caps (OpenCV order): real supported-grids array + ROI support.
-    if (g_of.nvOFGetCaps != nullptr)
+    // Two-stage caps: real supported-grids array + ROI support.
+    if (g_of12.nvOFGetCaps != nullptr)
     {
         uint32_t n = 0;
-        if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, nullptr, &n) ==
+        if (g_of12.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, nullptr, &n) ==
                 NV_OF_SUCCESS &&
             n > 0 && n <= 8)
         {
             uint32_t vals[8] = {};
             uint32_t m = n;
-            if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, vals, &m) ==
+            if (g_of12.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORTED_OUTPUT_GRID_SIZES, vals, &m) ==
                 NV_OF_SUCCESS)
             {
                 g_cap_grids_count = (m <= 8) ? m : 8;
@@ -638,11 +712,11 @@ bool create_of_locked(uint32_t w, uint32_t h)
             }
         }
         uint32_t roi = 0, rsz = sizeof(roi);
-        if (g_of.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORT_ROI, &roi, &rsz) == NV_OF_SUCCESS)
+        if (g_of12.nvOFGetCaps(g_of_handle, NV_OF_CAPS_SUPPORT_ROI, &roi, &rsz) == NV_OF_SUCCESS)
             g_cap_roi = roi;
     }
 
-    // int16 pairs staging for the array->host download (ceil, OpenCV order).
+    // int16 pairs staging for the device->host download.
     g_grid_w = (w + kOutGrid - 1) / kOutGrid;
     g_grid_h = (h + kOutGrid - 1) / kOutGrid;
     g_of_cpu.assign(static_cast<size_t>(g_grid_w) * g_grid_h * 2, 0);
@@ -651,18 +725,18 @@ bool create_of_locked(uint32_t w, uint32_t h)
 
     {
         const std::string msg =
-            "[NVOF Motion] session init ok (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+            "[NVOF Motion] D3D12 session init ok (" + std::to_string(w) + "x" + std::to_string(h) + ")";
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali19] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inGRAY8,arr) caps %u-%u x %u-%u "
+                 "[d3d12-1] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inR8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
                  g_cap_hmax, g_cap_grids_count,
                  g_cap_grids_list[0], g_cap_grids_list[1], g_cap_grids_list[2], g_cap_grids_list[3],
                  g_cap_grids_list[4], g_cap_grids_list[5], g_cap_grids_list[6], g_cap_grids_list[7],
-                 g_cap_roi, g_input_arrays[0], g_input_arrays[1], g_out_array, g_grid_w, g_grid_h);
+                 g_cap_roi, g_in_res[0], g_in_res[1], g_out_res, g_grid_w, g_grid_h);
         dbglog(buf);
     }
 
@@ -676,29 +750,14 @@ bool create_of_locked(uint32_t w, uint32_t h)
 // Caller must have drained the GPU first (wait_idle) when rebuilding.
 bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_t h)
 {
-    if (p_cuCtxSetCurrent == nullptr || g_cu_ctx == nullptr)
-        return false;
-    {
-        const CUresult sc = p_cuCtxSetCurrent(g_cu_ctx);
-        if (sc != CUDA_SUCCESS)
-        {
-            set_cu_status_locked("build set-current failed", sc);
-            return false;
-        }
-    }
-    check_ctx_locked("build");
-
     // On any failure below, the caller runs teardown_pipeline_locked(),
     // which safely drops partial state.
-    // NvOF session + input dims are aligned up (HW grid friendliness);
-    // readback + memcpy stay at the real frame size (subregion copy).
-    // Probe verdict (PASS on exact dims): NO session padding. Stock uses
-    // exact loader dims; padded 3456 sessions fail, exact 3440 works.
+    // Exact session dims (probe verdict: padding breaks execute).
     const uint32_t sw = w;
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali19] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-1] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -731,16 +790,6 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
             }
         }
         reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: fence+event ok");
-        if (g_stream == nullptr)
-        {
-            const CUresult src = p_cuStreamCreate(&g_stream, 0);
-            if (src != CUDA_SUCCESS || g_stream == nullptr)
-            {
-                set_cu_status_locked("cuStreamCreate failed", src);
-                break;
-            }
-        }
-        reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: stream ok");
         // Readback buffer for one frame (placed footprint of an RGBA8 image).
         {
             D3D12_RESOURCE_DESC img_desc = {};
@@ -891,20 +940,14 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
         }
 
         reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: output ok");
-        if (!create_of_locked(sw, sh))
+        if (!create_of_locked(d3d12, sw, sh))
             break;
 
         g_frame_w = w;
         g_frame_h = h;
-        g_roi.start_x = 0;
-        g_roi.start_y = 0;
-        g_roi.width = (w / 128) * 128;
-        g_roi.height = (h / 32) * 32;
         ok = true;
     } while (false);
 
-    if (p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(nullptr);
     return ok;
 }
 
@@ -926,95 +969,31 @@ static void on_init_device(device *device)
         set_status_locked("D3D12 device has no native handle", reshade::log::level::warning);
         return;
     }
-    if (g_owner_device == d3d12 && g_cu_ctx != nullptr)
+    if (g_owner_device == d3d12 && g_of_handle != nullptr)
         return; // already serving this device (session comes lazily)
     teardown_all_locked(); // clean start (also migrates multi-GPU)
 
-    if (!resolve_cuda_symbols_locked())
+    if (!resolve_nvof_locked())
         return;
 
-    CUresult cu = p_cuInit(0);
-    if (cu != CUDA_SUCCESS)
+    g_of12 = {};
     {
-        set_status_locked(cuda_error_text(cu).c_str(), reshade::log::level::warning);
-        return;
-    }
-
-    // Match CUDA device to the game's D3D12 adapter (LUID).
-    const LUID adapter_luid = d3d12->GetAdapterLuid();
-    int device_count = 0;
-    cu = p_cuDeviceGetCount(&device_count);
-    if (cu != CUDA_SUCCESS || device_count <= 0)
-    {
-        set_status_locked("no CUDA devices found", reshade::log::level::warning);
-        return;
-    }
-    int matched = -1;
-    for (int i = 0; i < device_count; ++i)
-    {
-        CUdevice dev = 0;
-        char luid_bytes[8] = {};
-        unsigned int node_mask = 0;
-        if (p_cuDeviceGet(&dev, i) != CUDA_SUCCESS)
-            continue;
-        if (p_cuDeviceGetLuid(luid_bytes, &node_mask, dev) != CUDA_SUCCESS)
-            continue;
-        if (std::memcmp(luid_bytes, &adapter_luid, 8) == 0)
-        {
-            matched = static_cast<int>(dev);
-            break;
-        }
-    }
-    if (matched < 0)
-    {
-        set_status_locked("no CUDA device matches the game adapter (LUID mismatch)", reshade::log::level::warning);
-        return;
-    }
-
-    // Fresh owned context (primary proved unusable for direct CUDA calls in
-    // this process: attach ok, first memcpy -> CU 201). Revert + test SLOW.
-    CUcontext ctx = nullptr;
-    cu = p_cuCtxCreate(&ctx, 0 /* CU_CTX_SCHED_AUTO */, static_cast<CUdevice>(matched));
-    if (cu != CUDA_SUCCESS || ctx == nullptr)
-    {
-        set_status_locked(cuda_error_text(cu).c_str(), reshade::log::level::warning);
-        return;
-    }
-    g_cu_ctx = ctx;
-    g_cu_device = 0;
-
-    if (g_nvof_dll == nullptr)
-    {
-        g_nvof_dll = LoadLibraryW(L"nvofapi64.dll");
-        if (g_nvof_dll != nullptr)
-            p_NvOFCreateInstanceCuda = reinterpret_cast<NvOFCreateInstance_fn>(
-                GetProcAddress(g_nvof_dll, "NvOFAPICreateInstanceCuda"));
-    }
-    if (p_NvOFCreateInstanceCuda == nullptr)
-    {
-        set_status_locked("nvofapi64.dll / entry missing - staying idle", reshade::log::level::warning);
-        p_cuCtxSetCurrent(nullptr);
-        return;
-    }
-    g_of = {};
-    {
-        const NV_OF_STATUS st = p_NvOFCreateInstanceCuda(NV_OF_API_VERSION, &g_of);
-        if (st != NV_OF_SUCCESS || g_of.nvCreateOpticalFlowCuda == nullptr || g_of.nvOFInit == nullptr ||
-            g_of.nvOFGetCaps == nullptr || g_of.nvOFDestroy == nullptr ||
-            g_of.nvOFCreateGPUBufferCuda == nullptr || g_of.nvOFGPUBufferGetCUarray == nullptr ||
-            g_of.nvOFDestroyGPUBufferCuda == nullptr || g_of.nvOFExecute == nullptr ||
-            g_of.nvOFGPUBufferGetCUdeviceptr == nullptr || g_of.nvOFSetIOCudaStreams == nullptr)
+        const NV_OF_STATUS st = p_NvOFCreateInstanceD3D12(NV_OF_API_VERSION, &g_of12);
+        if (st != NV_OF_SUCCESS || g_of12.nvCreateOpticalFlowD3D12 == nullptr ||
+            g_of12.nvOFInit == nullptr || g_of12.nvOFGetSurfaceFormatCountD3D12 == nullptr ||
+            g_of12.nvOFGetSurfaceFormatD3D12 == nullptr || g_of12.nvOFRegisterResourceD3D12 == nullptr ||
+            g_of12.nvOFUnregisterResourceD3D12 == nullptr || g_of12.nvOFExecuteD3D12 == nullptr ||
+            g_of12.nvOFDestroy == nullptr || g_of12.nvOFGetLastError == nullptr ||
+            g_of12.nvOFGetCaps == nullptr)
         {
             g_last_of_code = static_cast<int>(st);
-            set_status_locked("NvOFAPICreateInstanceCuda failed or incomplete", reshade::log::level::warning);
-            p_cuCtxSetCurrent(nullptr);
+            set_status_locked("NvOFAPICreateInstanceD3D12 failed or incomplete", reshade::log::level::warning);
             return;
         }
     }
 
     g_owner_device = d3d12;
     g_api_dev = device;
-    p_cuCtxSetCurrent(nullptr);
     set_status_locked("driver ready, waiting for first frame (session builds lazily)",
                       reshade::log::level::info);
 }
@@ -1036,7 +1015,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_cu_ctx == nullptr || g_owner_device == nullptr)
+    if (g_owner_device == nullptr)
         return; // init_device did not complete (or non-D3D12)
 
     device *dev = runtime->get_device();
@@ -1142,33 +1121,12 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         return;
     }
 
-    if (p_cuCtxSetCurrent != nullptr)
-    {
-        const CUresult sc = p_cuCtxSetCurrent(g_cu_ctx);
-        if (sc != CUDA_SUCCESS)
-        {
-            static int sc_logged = 0;
-            if (sc_logged < 3)
-            {
-                sc_logged++;
-                char buf[128] = {};
-                snprintf(buf, sizeof(buf), "[dali19] frame set-current FAILED: %d (ctx=%p)",
-                         static_cast<int>(sc), g_cu_ctx);
-                dbglog(buf);
-            }
-            g_last_cu_code = static_cast<int>(sc);
-            set_status_locked(cuda_error_text(sc).c_str(), reshade::log::level::warning);
-            return;
-        }
-    }
-    check_ctx_locked("frame");
-    // RGBA -> luma staging (OpenCV GRAYSCALE8 path); gray rows are session-pitched.
-    CUresult cu = CUDA_SUCCESS;
+    // RGBA -> luma staging (unchanged); then upload into the registered R8 input.
     if (g_gray_pitch == 0 || g_gray.size() < static_cast<size_t>(g_gray_pitch) * h)
     {
-        cu = CUDA_ERROR_INVALID_VALUE; // session/gray mismatch -> skip frame (loud)
+        set_status_locked("session/gray mismatch, skipping frame", reshade::log::level::warning);
+        return;
     }
-    else
     {
         uint8_t *gd = g_gray.data();
         const uint8_t *rb = static_cast<const uint8_t *>(g_readback_ptr);
@@ -1182,76 +1140,97 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                                                8);
         }
     }
-    CUDA_MEMCPY2D m = {};
-    m.srcXInBytes = 0;
-    m.srcY = 0;
-    m.srcMemoryType = CU_MEMORYTYPE_HOST;
-    m.srcHost = g_gray.data();
-    m.srcPitch = g_gray_pitch;
-    m.dstMemoryType = CU_MEMORYTYPE_ARRAY;
-    m.dstArray = g_input_arrays[g_frames_captured % 2];
-    m.WidthInBytes = static_cast<size_t>(w);
-    m.Height = h;
-    if (cu == CUDA_SUCCESS)
-        cu = p_cuMemcpy2DAsync(&m, g_stream);
-    if (cu == CUDA_SUCCESS)
-        cu = p_cuStreamSynchronize(g_stream);
+    const int fill_idx = static_cast<int>(g_frames_captured % 2);
+    // Upload: gray rows -> mapped UPLOAD staging -> registered R8 input (own list).
     {
-        static int xfer_logged = 0;
-        if (cu != CUDA_SUCCESS && xfer_logged < 3)
-        {
-            xfer_logged++;
-            char buf[192] = {};
-            snprintf(buf, sizeof(buf),
-                     "[dali19] frame xfer FAILED: cu=%d dstArray=%p stream=%p", static_cast<int>(cu),
-                     m.dstArray, g_stream);
-            dbglog(buf);
-        }
+        uint8_t *dst = static_cast<uint8_t *>(g_in_up_ptr[fill_idx]);
+        const uint8_t *src = g_gray.data();
+        const uint32_t pitch = g_in_foot[fill_idx].Footprint.RowPitch;
+        const size_t off = g_in_foot[fill_idx].Offset;
+        for (uint32_t y = 0; y < h; ++y)
+            std::memcpy(dst + off + static_cast<size_t>(y) * pitch, src + static_cast<size_t>(y) * w, w);
     }
-    // Cheap liveness proof: sampled checksum of the captured pixels.
-    uint64_t sum = 0;
-    if (cu == CUDA_SUCCESS)
+    if (FAILED(g_cmd_alloc->Reset()) || FAILED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
     {
-        const uint8_t *base = static_cast<const uint8_t *>(g_readback_ptr);
-        for (uint32_t y = 0; y < h; y += 8)
-        {
-            const uint8_t *row = base + static_cast<size_t>(y) * g_readback_pitch;
-            for (uint32_t x = 0; x < w * 4; x += 64)
-                sum += row[x];
-        }
+        set_status_locked("NvOF upload list reset failed", reshade::log::level::warning);
+        return;
     }
+    {
+        D3D12_RESOURCE_BARRIER to_dst = {};
+        to_dst.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_dst.Transition.pResource = g_in_res[fill_idx];
+        to_dst.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_dst.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        to_dst.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        g_cmd_list->ResourceBarrier(1, &to_dst);
+    }
+    {
+        D3D12_TEXTURE_COPY_LOCATION copy_dst = {};
+        copy_dst.pResource = g_in_res[fill_idx];
+        copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        copy_dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION copy_src = {};
+        copy_src.pResource = g_in_up[fill_idx];
+        copy_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        copy_src.PlacedFootprint = g_in_foot[fill_idx];
+        g_cmd_list->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr);
+    }
+    {
+        D3D12_RESOURCE_BARRIER to_common = {};
+        to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_common.Transition.pResource = g_in_res[fill_idx];
+        to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        g_cmd_list->ResourceBarrier(1, &to_common);
+    }
+    if (FAILED(g_cmd_list->Close()))
+    {
+        set_status_locked("NvOF upload list close failed", reshade::log::level::warning);
+        return;
+    }
+    {
+        ID3D12CommandList *lists[] = { g_cmd_list };
+        native_queue->ExecuteCommandLists(1, lists);
+        native_queue->Signal(g_app_fence, ++g_app_val);
+    }
+    wait_fence_value(g_app_fence, g_app_val); // upload copy done (blocking, ~instant)
 
-    // ---- NvOF execute on pair (prev, cur), convert on CPU, stats ----
-    // Runs synchronously (execute blocks by API design); only when both
-    // input buffers hold a frame (from the 2nd captured frame on).
+    // ---- NvOF D3D12 execute on pair (prev, cur), convert on CPU, stats ----
+    // Fully synchronous frames (blocking fence waits); only when both
+    // input resources hold a frame (from the 2nd captured frame on).
     bool have_vectors = false;
-    if (cu == CUDA_SUCCESS && g_frames_captured >= 1 && g_out_buf != nullptr && g_out_array != nullptr &&
-        !g_of_cpu.empty())
+    if (g_frames_captured >= 1 && g_in_bufs[0] != nullptr && g_in_bufs[1] != nullptr &&
+        g_out_buf != nullptr && !g_of_cpu.empty())
     {
-        const int just_filled = static_cast<int>(g_frames_captured % 2);
-        // DALI-faithful: zero-init only (no ROI, no hints flags).
-        NV_OF_EXECUTE_INPUT_PARAMS in_params = {};
-        // Stock SDK order (AppOFCuda: Execute(buf[i], buf[i+1]) = input OLDER).
-        // NOTE: flips flow sign vs dali6+; negate at consume time if it works.
-        in_params.inputFrame = g_input_bufs[1 - just_filled];
-        in_params.referenceFrame = g_input_bufs[just_filled];
-        // Guide default (temporal enabled); converges to the proven OpenCV
-        // recipe (gray8 + devptr + no-SetIO + cur/prev + temporal on).
-        in_params.disableTemporalHints = NV_OF_FALSE;
-        NV_OF_EXECUTE_OUTPUT_PARAMS out_params = {};
-        out_params.outputBuffer = g_out_buf;
-        out_params.outputCostBuffer = nullptr; // enableOutputCost=FALSE (OpenCV-faithful)
-        out_params.hPrivData = nullptr;
-        const NV_OF_STATUS ost = g_of.nvOFExecute(g_of_handle, &in_params, &out_params);
+        const int just_filled = fill_idx;
+        NV_OF_EXECUTE_INPUT_PARAMS_D3D12 in12 = {};
+        in12.inputFrame = g_in_bufs[1 - just_filled]; // older (stock order)
+        in12.referenceFrame = g_in_bufs[just_filled];
+        in12.externalHints = nullptr;
+        in12.disableTemporalHints = NV_OF_FALSE;
+        NV_OF_FENCE_POINT inFp = {};
+        inFp.fence = g_app_fence;
+        inFp.value = g_app_val;
+        in12.fencePoint = &inFp;
+        NV_OF_EXECUTE_OUTPUT_PARAMS_D3D12 out12 = {};
+        out12.outputBuffer = g_out_buf;
+        out12.outputCostBuffer = nullptr;
+        out12.hPrivData = nullptr;
+        NV_OF_FENCE_POINT outFp = {};
+        outFp.fence = g_ofa_fence;
+        outFp.value = ++g_ofa_val;
+        out12.fencePoint = &outFp;
+        const NV_OF_STATUS ost = g_of12.nvOFExecuteD3D12(g_of_handle, &in12, &out12);
         if (ost != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(ost);
             // Driver detail string (once per failure burst; overlay shows it).
-            if (g_of.nvOFGetLastError != nullptr)
+            if (g_of12.nvOFGetLastError != nullptr)
             {
                 char err[256] = {};
                 uint32_t errsz = sizeof(err);
-                if (g_of.nvOFGetLastError(g_of_handle, err, &errsz) == NV_OF_SUCCESS && err[0] != '\0')
+                if (g_of12.nvOFGetLastError(g_of_handle, err, &errsz) == NV_OF_SUCCESS && err[0] != '\0')
                     g_last_of_error.assign(err);
             }
             if (g_dbg_fail_lines < 5)
@@ -1259,17 +1238,17 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali19] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-1] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
-                         in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
+                         in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
                          static_cast<unsigned long long>(g_frames_captured));
                 dbglog(buf);
             }
             if (g_exec_ok)
             {
                 g_exec_ok = false;
-                std::string msg = std::string("nvOFExecute failed") +
+                std::string msg = std::string("nvOFExecuteD3D12 failed") +
                     (g_last_of_error.empty() ? "" : std::string(" : ") + g_last_of_error);
                 set_status_locked(msg.c_str(), reshade::log::level::warning);
             }
@@ -1277,46 +1256,74 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         else
         {
             g_exec_ok = true;
-            // SHORT2 vectors -> host (int16 pairs); float convert happens on CPU.
-            CUDA_MEMCPY2D d = {};
-            d.srcMemoryType = CU_MEMORYTYPE_ARRAY;
-            d.srcArray = g_out_array;
-            d.dstMemoryType = CU_MEMORYTYPE_HOST;
-            d.dstHost = g_of_cpu.data();
-            d.dstPitch = static_cast<size_t>(g_grid_w) * sizeof(int16_t) * 2;
-            d.WidthInBytes = static_cast<size_t>(g_grid_w) * sizeof(int16_t) * 2;
-            d.Height = g_grid_h;
-            cu = p_cuMemcpy2DAsync(&d, g_stream);
-            if (cu == CUDA_SUCCESS)
-                cu = p_cuStreamSynchronize(g_stream);
-            if (cu == CUDA_SUCCESS)
+            // SHORT2 vectors -> host: queue-wait exec, copy to staging, CPU wait.
+            if (FAILED(g_cmd_alloc->Reset()) || FAILED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
             {
-                g_executes++;
-                if (g_executes == 1)
-                {
-                    char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali19] first execute OK: grid %ux%u",
-                             g_grid_w, g_grid_h);
-                    dbglog(buf);
-                }
-                have_vectors = true;
+                set_status_locked("NvOF download list reset failed", reshade::log::level::warning);
+                return;
             }
-            else if (g_exec_ok)
+            native_queue->Wait(g_ofa_fence, g_ofa_val);
             {
-                g_exec_ok = false;
-                set_cu_status_locked("output download failed", cu);
+                D3D12_RESOURCE_BARRIER to_src = {};
+                to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                to_src.Transition.pResource = g_out_res;
+                to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                g_cmd_list->ResourceBarrier(1, &to_src);
             }
+            {
+                D3D12_TEXTURE_COPY_LOCATION copy_dst = {};
+                copy_dst.pResource = g_out_down;
+                copy_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                copy_dst.PlacedFootprint = g_out_foot;
+                D3D12_TEXTURE_COPY_LOCATION copy_src = {};
+                copy_src.pResource = g_out_res;
+                copy_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                copy_src.SubresourceIndex = 0;
+                g_cmd_list->CopyTextureRegion(&copy_dst, 0, 0, 0, &copy_src, nullptr);
+            }
+            {
+                D3D12_RESOURCE_BARRIER to_common = {};
+                to_common.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                to_common.Transition.pResource = g_out_res;
+                to_common.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                to_common.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                to_common.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+                g_cmd_list->ResourceBarrier(1, &to_common);
+            }
+            if (FAILED(g_cmd_list->Close()))
+            {
+                set_status_locked("NvOF download list close failed", reshade::log::level::warning);
+                return;
+            }
+            {
+                ID3D12CommandList *lists[] = { g_cmd_list };
+                native_queue->ExecuteCommandLists(1, lists);
+                native_queue->Signal(g_fence, ++g_fence_value);
+            }
+            g_fence->SetEventOnCompletion(g_fence_value, g_frame_event);
+            WaitForSingleObject(g_frame_event, INFINITE); // download done (stock pattern)
+            {
+                const uint8_t *src = static_cast<const uint8_t *>(g_out_down_ptr) + g_out_foot.Offset;
+                const uint32_t pitch = g_out_foot.Footprint.RowPitch;
+                const size_t rowbytes = static_cast<size_t>(g_grid_w) * sizeof(int16_t) * 2;
+                int16_t *dst = g_of_cpu.data();
+                for (uint32_t y = 0; y < g_grid_h; ++y)
+                    std::memcpy(dst + static_cast<size_t>(y) * g_grid_w * 2,
+                                src + static_cast<size_t>(y) * pitch, rowbytes);
+            }
+            g_executes++;
+            if (g_executes == 1)
+            {
+                char buf[256] = {};
+                snprintf(buf, sizeof(buf), "[d3d12-1] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                dbglog(buf);
+            }
+            have_vectors = true;
         }
     }
-    if (p_cuCtxSetCurrent != nullptr)
-        p_cuCtxSetCurrent(nullptr);
 
-    if (cu != CUDA_SUCCESS)
-    {
-        g_last_cu_code = static_cast<int>(cu);
-        set_status_locked(cuda_error_text(cu).c_str(), reshade::log::level::warning);
-        return;
-    }
     g_scene_active = (g_last_checksum != 0 && sum != g_last_checksum);
     g_last_checksum = sum;
     g_frames_captured++;
@@ -1451,7 +1458,7 @@ static void draw_overlay(effect_runtime *)
     bool target_found = false, target_ok = false;
     float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f;
     char target_tex[128] = {};
-    int last_cu = 0, last_of = 0;
+    int last_of = 0;
     std::string last_of_err;
     uint32_t grids_list[8] = {};
     uint32_t grids_count = 0;
@@ -1479,7 +1486,6 @@ static void draw_overlay(effect_runtime *)
         flow_avg = g_flow_avg;
         flow_moving = g_flow_moving_pct;
         flow_scale = g_flow_scale;
-        last_cu = g_last_cu_code;
         last_of = g_last_of_code;
         last_of_err = g_last_of_error;
         grids_count = (g_cap_grids_count <= 8) ? g_cap_grids_count : 8;
@@ -1493,7 +1499,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali19]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-1]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1546,7 +1552,7 @@ static void draw_overlay(effect_runtime *)
     }
     if (target_tex[0] != '\0')
         ImGui::Text("Target '%s': %s", target_tex, target_ok ? "injected" : (target_found ? "found" : "not found"));
-    ImGui::Text("Last codes: CU %d, OF %d", last_cu, last_of);
+    ImGui::Text("Last code: OF %d", last_of);
     if (!last_of_err.empty())
         ImGui::TextWrapped("OF detail: %s", last_of_err.c_str());
     ImGui::TextWrapped("%s", status.c_str());
@@ -1605,7 +1611,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
     case DLL_PROCESS_DETACH:
         unregister_addon_nvof();
         reshade::unregister_addon(hModule);
-        // NOTE: loaded DLLs, CUDA context and native objects are intentionally
+        // NOTE: loaded DLLs and native objects are intentionally
         // NOT torn down here; driver calls inside DllMain risk loader-lock
         // deadlocks. The OS reclaims everything on process exit.
         break;

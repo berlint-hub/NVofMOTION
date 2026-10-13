@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -121,14 +121,16 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali16]` (still OF5): stock input order, no change.
 - Current test build `[dali17]` (still OF5): exact stock default recipe
   (CUARRAY + MEDIUM + SetIO-nulls) fails identically – params exonerated.
-- Current test build `[dali19]` (still OF5): exact dims, no change.
-- Last process diff probe-vs-addon: probe runs single-threaded, addon
-  inits on one thread and executes on the game thread (with
-  attach/detach cycling). Probe now has CASE-THREADED (bring-up on main
-  + detach, frame on worker + detach – addon discipline). Run probe only
-  (fast, no game): worker OF5 = threading/context-migration trigger
-  (fix = push/pop discipline or per-thread attach in addon); worker
-  PASS = D3D12-active-GPU theory, pivot to native D3D12 NvOF.
+- PROBE VERDICTS: stock recipe PASSES single-threaded AND worker-threaded
+  (+8.00px exact, 640x480 + 3440x1440, apiVer 0x50, driver maxApiVer 0x50).
+  Driver healthy, threading innocent. Only remaining delta: D3D12-active
+  process (PCSX2+ReShade) vs clean probe.
+- PIVOT `[d3d12-1]` = native D3D12 NvOF backend (no CUDA at all): session on
+  the game device, DEFAULT R8_UNORM inputs + R16G16_SINT grid output,
+  UPLOAD/READBACK staging, app/ofa fences (stock AppOFD3D12 discipline:
+  upload signals app++, execute waits app + signals ofa++, download waits
+  ofa), grid1/MEDIUM/gray/input-older/temporal-on. If execute passes,
+  phase 2b is unblocked – then tune (grid4/FAST) + phase 2c consumer.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

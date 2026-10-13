@@ -11,15 +11,14 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
 ## Roadmap
 
-- **1a (done):** build + load + overlay + probe `nvofapi64.dll` /
-  `NvOFAPICreateInstanceCuda`, status reporting. No CUDA toolkit needed.
-- **1b (done):** CUDA context (LUID-matched to the game adapter), NvOF
-  session create/init, `nvOFGetCaps` in the overlay.
-- **2a (done):** lazy session at real frame size + rebuild on resize, own
-  native command list + fence, readback capture + HtoD into NvOF inputs,
-  checksum liveness proof in overlay.
-- **2b (this):** `NvOFExecute`, PTX int16->float convert, R16G16F output +
-  `MotionVectors` binding / configurable `TargetTexture` injection, stats.
+- **CUDA era (retired):** `NvOFAPICreateInstanceCuda` bring-up, LUID-matched
+  context, HtoD capture – deterministic OF5 on every execute in the
+  D3D12-active process (19 bisect builds `[streams]`, `[dali0]`-`[dali19]`;
+  stock recipe passes in the clean `nvof_probe.exe`). See STATUS.md.
+- **D3D12 backend (this):** native `NvOFAPICreateInstanceD3D12` session on
+  the game device – DEFAULT R8_UNORM inputs + R16G16_SINT grid output,
+  UPLOAD/READBACK staging, app/ofa fences (stock AppOFD3D12 discipline).
+  No CUDA, no `nvcuda.dll`.
 
 ## Shader interface
 
@@ -34,8 +33,8 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 ## Requirements
 
 - Windows x64, D3D12 game (v1 supports D3D12 only, silent elsewhere)
-- NVIDIA Turing+ GPU + driver with NvOF (driver 445.87+; ships `nvofapi64.dll`
-  and `nvcuda.dll`; both bound explicitly at runtime, no .lib linkage)
+- NVIDIA Turing+ GPU + driver with NvOF (ships `nvofapi64.dll`, bound
+  explicitly at runtime, no .lib linkage)
 - Backbuffer R8G8B8A8 (otherwise idle with status)
 - On AMD/Intel or without those DLLs the add-on stays idle (see overlay)
 
@@ -54,7 +53,6 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
 Workflow `.github/workflows/build-nvof.yml` (`windows-2022`, x64 Release):
 - checkout `crosire/reshade` into `reshade-main` (headers + `deps/imgui`)
-- checkout `NVIDIA/NVIDIAOpticalFlowSDK` into `nvof-sdk` (BSD headers)
-- install the CUDA toolkit (for `cuda.h` + `nvcc`; types and PTX only,
-  nothing linked)
-- CMake (PTX kernel -> embedded header) + upload artifact `nvof_motion.addon64`
+- checkout `mbucchia/Optical-Flow-SDK` `NvOFInterface` into `nvof-sdk` (API 5.0)
+- install the CUDA toolkit (probe links `cuda.lib`; addon itself is CUDA-free)
+- CMake + upload artifacts `nvof_motion.addon64`, `nvof_probe.exe`
