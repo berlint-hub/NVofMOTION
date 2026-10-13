@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali8]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali9]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -80,10 +80,16 @@ buffer – impossible on PCSX2, PS2-era games have none).
   content-independence).
 - Current test build `[dali7]` (still OF5): SetIO skipped, no change –
   streams ruled out.
-- Current test build `[dali8]` = input buffers ABGR8 -> GRAYSCALE8 with CPU
-  RGBA->luma staging (OpenCV-faithful; output stays SHORT2). If this passes,
-  packed-RGB input was the INVALID_PARAM trigger.
-- If `[dali8]` still OF5, next: `apiVer` (SDK 5.x headers).
+- Current test build `[dali8]` (still OF5): GRAYSCALE8, no change – format
+  ruled out. Verified from 2.0 headers: OF 5 = INVALID_PARAM, execute is
+  async (NULL-stream ordering is safe via legacy sync), ROI rules confirmed.
+- Current test build `[dali9]` = `disableTemporalHints = FALSE` (guide
+  default). This converges to the byte-identical proven OpenCV recipe
+  (gray8 + devptr + stride + no-SetIO + cur/prev + temporal on); it is the
+  last remaining execute-param difference.
+- If `[dali9]` still OF5, next: perfLevel FAST->SLOW, then primary CUDA
+  context, then `apiVer` (needs gated SDK 5.x headers from your NVIDIA
+  account) or driver reinstall.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
