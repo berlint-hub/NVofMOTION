@@ -105,6 +105,9 @@ buffer – impossible on PCSX2, PS2-era games have none).
   input/ref order, align 8/128, sizes 3440+1718, static/animated content,
   fresh ctx (OF5) vs primary ctx (CU 201 on direct calls), FAST/SLOW,
   grid 4/1. First execute always OF 5 + generic `Internal execution status`.
+- Rig (NEMESIS-PC, 13.10.2026): RTX 4080 16GB, driver **617.14** (DCH,
+  CUDA 13.4.96, Oct 2026 – very new). 2.0-era execute on this driver is the
+  prime regression suspect.
 - STOP blind bisect. Needed from the rig (pick any): (1) driver version
   (`nvidia-smi` – asked 3x, still unknown!), (2) stock SDK sample result
   (AppOF CUDA from NVIDIAOpticalFlowSDK – machine vs code verdict),
