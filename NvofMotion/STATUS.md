@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-10]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-11]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -182,6 +182,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   directions, black static), executes 10520/10521, avg 12.19px / 94.3%.
   Vectors are real. Overlay "Target: not found" is the INJECTION target
   (needs an effect-side variable) – expected.
+- Telemetry find: bottom-right corner reports exactly -1024.0
+  (raw INT16_MIN) = driver "no match" sentinel. It poisoned avg (spikes
+  to ~960px). `[d3d12-11]` filters exact -32768 in either lane (-> 0 in
+  texture, excluded from avg, new `invalid %` overlay row). Injection
+  target name must match the effect variable EXACTLY (`motion_vectors_tex`,
+  not `MotionVectors`).
 - PHASE 2c fix: debug `.fx` now DECLARES `texture motion_vectors_tex`
   (860x360 RG16F) and visualizes the INJECTED copy (PPOM pattern:
   addon `find_texture_variable` + copy, dims must match grid). Set addon

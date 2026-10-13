@@ -154,6 +154,7 @@ bool g_target_ok = false;
 bool g_exec_ok = true;
 float g_flow_avg = 0.0f;
 float g_flow_moving_pct = 0.0f;
+float g_flow_invalid_pct = 0.0f;
 uint64_t g_executes = 0;
 
 uint64_t g_frames_captured = 0;
@@ -731,7 +732,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-10] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-11] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -759,7 +760,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-10] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-11] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1279,7 +1280,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-10] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-11] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1358,7 +1359,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-10] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-11] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 60th execute: frozen vs live data?
@@ -1377,7 +1378,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-10] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-11] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1399,24 +1400,34 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     {
         const size_t total = static_cast<size_t>(g_grid_w) * g_grid_h;
         double acc = 0.0;
-        size_t moving = 0;
+        size_t moving = 0, invalid = 0, valid = 0;
         for (size_t i = 0; i < total; ++i)
         {
             // S10.5 hardware units -> px (g_flow_scale, default 1/32).
-            const float fx = static_cast<float>(g_of_cpu[i * 2]) * g_flow_scale;
-            const float fy = static_cast<float>(g_of_cpu[i * 2 + 1]) * g_flow_scale;
+            // Exact INT16_MIN in either lane = driver "no match" sentinel.
+            const int16_t rx = g_of_cpu[i * 2], ry = g_of_cpu[i * 2 + 1];
+            const bool bad = (rx == INT16_MIN || ry == INT16_MIN);
+            const float fx = bad ? 0.0f : static_cast<float>(rx) * g_flow_scale;
+            const float fy = bad ? 0.0f : static_cast<float>(ry) * g_flow_scale;
             const size_t row = i / g_grid_w, col = i % g_grid_w;
             uint16_t *px = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(g_upload_ptr) +
                                                         row * g_up_pitch + col * 4);
             px[0] = float_to_half(fx);
             px[1] = float_to_half(fy);
+            if (bad)
+            {
+                ++invalid;
+                continue;
+            }
+            ++valid;
             const double len = sqrt(static_cast<double>(fx) * fx + static_cast<double>(fy) * fy);
             acc += len;
             if (len > 0.5)
                 ++moving;
         }
-        g_flow_avg = static_cast<float>(acc / (total != 0 ? total : 1));
+        g_flow_avg = static_cast<float>(acc / (valid != 0 ? valid : 1));
         g_flow_moving_pct = 100.0f * static_cast<float>(moving) / static_cast<float>(total != 0 ? total : 1);
+        g_flow_invalid_pct = 100.0f * static_cast<float>(invalid) / static_cast<float>(total != 0 ? total : 1);
 
         if (SUCCEEDED(g_cmd_alloc->Reset()) && SUCCEEDED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
         {
@@ -1521,7 +1532,7 @@ static void draw_overlay(effect_runtime *)
     uint32_t fw = 0, fh = 0;
     bool active = false;
     bool target_found = false, target_ok = false;
-    float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f;
+    float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f, flow_invalid = 0.0f;
     char target_tex[128] = {};
     int last_of = 0;
     bool show_tex = false;
@@ -1553,6 +1564,7 @@ static void draw_overlay(effect_runtime *)
         target_ok = g_target_ok;
         flow_avg = g_flow_avg;
         flow_moving = g_flow_moving_pct;
+        flow_invalid = g_flow_invalid_pct;
         flow_scale = g_flow_scale;
         last_of = g_last_of_code;
         show_tex = g_show_tex;
@@ -1571,7 +1583,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-10]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-11]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1627,7 +1639,7 @@ static void draw_overlay(effect_runtime *)
         ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu, skips %llu, executes %llu", fw, fh, frames,
                     memcpys, skips, executes);
     ImGui::Text("Scene activity: %s", active ? "yes (pixels change)" : "no");
-    ImGui::Text("Flow: avg %.2f px, moving %.1f%%", flow_avg, flow_moving);
+    ImGui::Text("Flow: avg %.2f px, moving %.1f%%, invalid %.1f%%", flow_avg, flow_moving, flow_invalid);
     if (ImGui::DragFloat("Flow scale (px per unit)", &flow_scale, 0.001f, 0.001f, 1.0f))
     {
         std::lock_guard<std::mutex> lock(g_mutex);
