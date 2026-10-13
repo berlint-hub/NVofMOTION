@@ -166,7 +166,7 @@ void check_ctx_locked(const char *where)
     {
         logged++;
         char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali17] CTX %s: get=%d cur=%p expected=%p", where,
+        snprintf(buf, sizeof(buf), "[dali18] CTX %s: get=%d cur=%p expected=%p", where,
                  static_cast<int>(g), cur, g_cu_ctx);
         dbglog(buf);
     }
@@ -497,6 +497,15 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         }
         g_of_handle = hOf;
 
+        // Stock order (NvOFCudaAPI ctor): SetIO BEFORE init, unconditionally
+        // (AppOFCuda default = null streams).
+        st = g_of.nvOFSetIOCudaStreams(hOf, nullptr, nullptr);
+        if (st != NV_OF_SUCCESS)
+        {
+            g_last_of_code = static_cast<int>(st);
+            return false;
+        }
+
         g_crash_stage = 2;
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
@@ -515,15 +524,6 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         init.hPrivData = nullptr;
 
         st = g_of.nvOFInit(hOf, &init);
-        if (st != NV_OF_SUCCESS)
-        {
-            g_last_of_code = static_cast<int>(st);
-            return false;
-        }
-
-        // Stock default (AppOFCuda main): SetIO called unconditionally,
-        // here with null streams (their useCudaStream=0 default).
-        st = g_of.nvOFSetIOCudaStreams(hOf, nullptr, nullptr);
         if (st != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(st);
@@ -655,7 +655,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali17] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inGRAY8,arr) caps %u-%u x %u-%u "
+                 "[dali18] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inGRAY8,arr) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -698,7 +698,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali17] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali18] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1152,7 +1152,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             {
                 sc_logged++;
                 char buf[128] = {};
-                snprintf(buf, sizeof(buf), "[dali17] frame set-current FAILED: %d (ctx=%p)",
+                snprintf(buf, sizeof(buf), "[dali18] frame set-current FAILED: %d (ctx=%p)",
                          static_cast<int>(sc), g_cu_ctx);
                 dbglog(buf);
             }
@@ -1203,7 +1203,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             xfer_logged++;
             char buf[192] = {};
             snprintf(buf, sizeof(buf),
-                     "[dali17] frame xfer FAILED: cu=%d dstArray=%p stream=%p", static_cast<int>(cu),
+                     "[dali18] frame xfer FAILED: cu=%d dstArray=%p stream=%p", static_cast<int>(cu),
                      m.dstArray, g_stream);
             dbglog(buf);
         }
@@ -1259,7 +1259,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali17] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali18] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1295,7 +1295,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali17] first execute OK: grid %ux%u",
+                    snprintf(buf, sizeof(buf), "[dali18] first execute OK: grid %ux%u",
                              g_grid_w, g_grid_h);
                     dbglog(buf);
                 }
@@ -1493,7 +1493,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali17]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali18]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
