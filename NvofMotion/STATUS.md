@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-5]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-6]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -154,10 +154,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
   candidate. Stale-upload candidate: post-execute resource states unknown,
   our COMMON->COPY_* barriers could silently no-op after NVOFA touches
   the resources (first upload works, rest frozen at first frames).
-- Current test build `[d3d12-5]` = `disableTemporalHints = TRUE` +
-  overlay `Synthetic +8px test` toggle (shifting gradient pair through the
-  SAME upload path; expect constant avg ~8px). Decides: synth ~8px = path
-  healthy (content/noise issue); synth frozen garbage = plumbing broken.
+- `[d3d12-5]` temporal OFF + synth toggle: static scene reads ~0-1px
+  CORRECT, but synth +8px pattern reads ~0.06 (WRONG – probe reads +8.00
+  with the identical pattern). Only remaining diffs vs probe for synth:
+  temporal OFF (probe ON), grid4 (probe grid1), FAST (probe MEDIUM).
+- Current test build `[d3d12-6]` = temporal back ON (single variable).
+  If synth reads +8 → temporal-OFF path zeroes steady motion on this
+  stack (keep ON). If synth still ~0 → next grid1, then MEDIUM.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
