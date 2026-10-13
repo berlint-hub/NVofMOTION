@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali14]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali15]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -108,11 +108,18 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Rig (NEMESIS-PC, 13.10.2026): RTX 4080 16GB, driver **617.14** (DCH,
   CUDA 13.4.96, Oct 2026 – very new). 2.0-era execute on this driver is the
   prime regression suspect.
-- STOP blind bisect. Needed from the rig (pick any): (1) driver version
-  (`nvidia-smi` – asked 3x, still unknown!), (2) stock SDK sample result
-  (AppOF CUDA from NVIDIAOpticalFlowSDK – machine vs code verdict),
-  (3) SDK 5.x headers (gated download with your NVIDIA account) for the
-  `apiVer` bump (public GitHub headers are stale at 2.0).
+- BREAKTHROUGH (from mbucchia/Optical-Flow-SDK mirror, your link): full
+  SDK 5.0 with stock samples. Stock `NvOF::Init` sets
+  `NV_OF_INIT_PARAMS::inputBufferFormat` – a field that DOES NOT EXIST in
+  2.0. Driver 617.14 (5.x-era) running our apiVer 2.0 session is the prime
+  suspect for the deterministic first-execute OF 5.
+- Current test build `[dali15]` = **apiVer 5.0 bump**: CI headers switched
+  to `mbucchia/Optical-Flow-SDK@NvOFInterface` (sparse), `NV_OF_API_VERSION`
+  0x20->0x50 (verify `api=0x50` in debug log), `init.inputBufferFormat =
+  GRAYSCALE8` set; predDirection/globalFlow zero (FORWARD/off); everything
+  else = `[dali14]` (grid1, SLOW, gray, no-SetIO, cur/prev, temporal on).
+  If this passes, the 2.0-compat path was the trigger – then restore
+  grid4+FAST in a follow-up.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

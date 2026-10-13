@@ -7,8 +7,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # ── Paths ───────────────────────────────────────────────────────────────────
 set(RESHADE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../reshade-main" CACHE PATH
     "Root of the crosire/reshade checkout (must contain include/ and deps/)")
-# Root of the NVIDIAOpticalFlowSDK checkout (nvOpticalFlowCommon.h and
-# nvOpticalFlowCuda.h at its root). Phase 1b+ requires it.
+# Root of the NvOF headers (nvOpticalFlowCommon.h and
+# nvOpticalFlowCuda.h). Points at NvOFInterface/ of the mbucchia/Optical-Flow-SDK
+# mirror (API 5.0; NVIDIA's own GitHub is stale at 2.0).
 set(NVOF_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../nvof-sdk" CACHE PATH
     "Root of the NVIDIAOpticalFlowSDK checkout")
 # Root of an installed CUDA toolkit (provides cuda.h for types and nvcc for

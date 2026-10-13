@@ -43,12 +43,15 @@ jobs:
           fetch-depth: 1
           submodules: recursive
 
-      - name: Checkout NvOF headers (NVIDIA/NVIDIAOpticalFlowSDK)
+      - name: Checkout NvOF headers (mbucchia/Optical-Flow-SDK mirror, API 5.0)
         uses: actions/checkout@v4
         with:
-          repository: NVIDIA/NVIDIAOpticalFlowSDK
+          repository: mbucchia/Optical-Flow-SDK
           path: nvof-sdk
           fetch-depth: 1
+          sparse-checkout: |
+            NvOFInterface
+          sparse-checkout-cone-mode: false
 
       - name: Install CUDA toolkit (headers only; nothing linked)
         uses: Jimver/cuda-toolkit@v0.2.36
@@ -69,8 +72,8 @@ jobs:
         run: |
           if (-not (Test-Path "reshade-main/include/reshade.hpp")) { throw "missing reshade-main/include/reshade.hpp" }
           if (-not (Test-Path "reshade-main/deps/imgui/imgui.h")) { throw "missing reshade-main/deps/imgui/imgui.h (submodules?)" }
-          if (-not (Test-Path "nvof-sdk/nvOpticalFlowCommon.h")) { throw "missing nvof-sdk/nvOpticalFlowCommon.h" }
-          if (-not (Test-Path "nvof-sdk/nvOpticalFlowCuda.h")) { throw "missing nvof-sdk/nvOpticalFlowCuda.h" }
+          if (-not (Test-Path "nvof-sdk/NvOFInterface/nvOpticalFlowCommon.h")) { throw "missing nvof-sdk/NvOFInterface/nvOpticalFlowCommon.h" }
+          if (-not (Test-Path "nvof-sdk/NvOFInterface/nvOpticalFlowCuda.h")) { throw "missing nvof-sdk/NvOFInterface/nvOpticalFlowCuda.h" }
           if (-not (Test-Path "NvofMotion/nvof_motion.cpp")) { throw "missing NvofMotion/nvof_motion.cpp" }
           if (-not (Test-Path "NvofMotion/CMakeLists.txt")) { throw "missing NvofMotion/CMakeLists.txt" }
           if (-not $env:CUDA_PATH) { throw "CUDA_PATH not set by cuda-toolkit action" }
@@ -78,7 +81,7 @@ jobs:
 
       - name: Configure (x64)
         shell: pwsh
-        run: cmake -S NvofMotion -B build -A x64 "-DRESHADE_ROOT=${{ github.workspace }}/reshade-main" "-DNVOF_SDK=${{ github.workspace }}/nvof-sdk"
+        run: cmake -S NvofMotion -B build -A x64 "-DRESHADE_ROOT=${{ github.workspace }}/reshade-main" "-DNVOF_SDK=${{ github.workspace }}/nvof-sdk/NvOFInterface"
 
       - name: Build Release
         shell: pwsh
