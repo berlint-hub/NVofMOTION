@@ -6,7 +6,7 @@
 //    is copied into a CPU-visible readback buffer, signaled through our own
 //    fence; completion is polled with zero timeout (never stalls - a busy
 //    frame is simply skipped and self-heals next frame), then the pixels are
-//    uploaded into the NvOF input CUDA array (HtoD) and checksummed.
+//    uploaded into the NvOF input CUDA buffer (HtoD) and checksummed.
 //  - NvOFExecute runs on the (prev, cur) pair; SHORT2 output is downloaded
 //    to CPU and converted to half + stats; a second native list uploads into
 //    the R16G16F output texture, injects into TargetTexture and updates the
@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -106,6 +107,42 @@ bool g_session_active = false;
 unsigned int g_enabled = 1;
 bool g_d3d12_seen = false;
 std::string g_status = "not initialized yet";
+
+// ---- file debug log next to the addon (bisect forensics; user attaches it) ----
+HMODULE g_hmod = nullptr;
+wchar_t g_dbglog_path[MAX_PATH] = {};
+int g_dbg_fail_lines = 0;
+
+void dbglog_init()
+{
+    if (g_hmod == nullptr || g_dbglog_path[0] != L'\0')
+        return;
+    wchar_t path[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(g_hmod, path, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return;
+    wchar_t *slash = wcsrchr(path, L'\\');
+    if (slash == nullptr || static_cast<size_t>(slash + 1 - path) + 22u >= MAX_PATH)
+        return;
+    *(slash + 1) = L'\0';
+    wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"nvof_motion_debug.log");
+    wcscpy_s(g_dbglog_path, MAX_PATH, path);
+}
+
+// Rare events only (bring-up, failures, first success). Own mutex, callable anywhere.
+void dbglog(const char *line)
+{
+    static std::mutex log_mutex;
+    std::lock_guard<std::mutex> lock(log_mutex);
+    if (g_dbglog_path[0] == L'\0')
+        return;
+    FILE *f = nullptr;
+    if (_wfopen_s(&f, g_dbglog_path, L"a") != 0 || f == nullptr)
+        return;
+    fputs(line, f);
+    fputc('\n', f);
+    fclose(f);
+}
 
 // ---- frame pipeline (all guarded by g_mutex) ----
 ID3D12CommandAllocator *g_cmd_alloc = nullptr;
@@ -594,6 +631,18 @@ bool create_of_locked(uint32_t w, uint32_t h)
         const std::string msg =
             "[NVOF Motion] session init ok (" + std::to_string(w) + "x" + std::to_string(h) + ")";
         reshade::log::message(reshade::log::level::info, msg.c_str());
+        char buf[768] = {};
+        snprintf(buf, sizeof(buf),
+                 "[dali5] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF) caps %u-%u x %u-%u "
+                 "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
+                 "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
+                 w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
+                 g_cap_grids_list[0], g_cap_grids_list[1], g_cap_grids_list[2], g_cap_grids_list[3],
+                 g_cap_grids_list[4], g_cap_grids_list[5], g_cap_grids_list[6], g_cap_grids_list[7],
+                 g_cap_roi, static_cast<unsigned long long>(g_input_ptrs[0]), g_input_pitch[0],
+                 static_cast<unsigned long long>(g_input_ptrs[1]), g_input_pitch[1],
+                 static_cast<unsigned long long>(g_out_ptr), g_out_pitch, g_grid_w, g_grid_h);
+        dbglog(buf);
     }
 
     g_last_of_error.clear();
@@ -614,8 +663,15 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     // which safely drops partial state.
     // NvOF session + input dims are aligned up (HW grid friendliness);
     // readback + memcpy stay at the real frame size (subregion copy).
-    const uint32_t sw = (w + 7u) & ~7u;
-    const uint32_t sh = (h + 7u) & ~7u;
+    // Bisect NVOFA HW alignment (3440 % 32 = 16): session + buffers padded
+    // to 128x32 (ROI-grade); upload stays a real-size subregion.
+    const uint32_t sw = (w + 127u) & ~127u;
+    const uint32_t sh = (h + 31u) & ~31u;
+    {
+        char buf[128] = {};
+        snprintf(buf, sizeof(buf), "[dali5] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        dbglog(buf);
+    }
     bool ok = false;
     do // single-pass for linear error handling
     {
@@ -1113,6 +1169,18 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_of.nvOFGetLastError(g_of_handle, err, &errsz) == NV_OF_SUCCESS && err[0] != '\0')
                     g_last_of_error.assign(err);
             }
+            if (g_dbg_fail_lines < 5)
+            {
+                g_dbg_fail_lines++;
+                char buf[512] = {};
+                snprintf(buf, sizeof(buf),
+                         "[dali5] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "frames=%llu",
+                         g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
+                         in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
+                         static_cast<unsigned long long>(g_frames_captured));
+                dbglog(buf);
+            }
             if (g_exec_ok)
             {
                 g_exec_ok = false;
@@ -1140,6 +1208,13 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (cu == CUDA_SUCCESS)
             {
                 g_executes++;
+                if (g_executes == 1)
+                {
+                    char buf[256] = {};
+                    snprintf(buf, sizeof(buf), "[dali5] first execute OK: grid %ux%u outPitch %u",
+                             g_grid_w, g_grid_h, g_out_pitch);
+                    dbglog(buf);
+                }
                 have_vectors = true;
             }
             else if (g_exec_ok)
@@ -1334,7 +1409,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali4]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali5]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1417,6 +1492,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
     switch (fdwReason)
     {
     case DLL_PROCESS_ATTACH:
+        g_hmod = hModule;
+        dbglog_init();
         if (!reshade::register_addon(hModule))
             return FALSE;
         reshade::get_config_value(nullptr, "NVOF", "Enable", g_enabled);

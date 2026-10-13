@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`, `[dali1]`, `[dali2]`, `[dali3]`, `[dali4]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali5]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -69,10 +69,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
   (OpenCV order) + zero-init + hintGrid UNDEFINED. SetIO order ruled out.
 - Current test build `[dali3]` (still OF5, frames 140): as `[dali2]` +
   `disableTemporalHints = TRUE`. Temporal theory ruled out.
-- Current test build `[dali4]` = input+output buffers switched CUARRAY ->
-  CUDEVICEPTR with driver stride upload/download (OpenCV-faithful; ABGR8
-  kept). If this passes, the CUARRAY path was the INVALID_PARAM trigger.
-- If `[dali4]` still OF5, next: input/reference order swap, then `apiVer`.
+- Current test build `[dali4]` (still OF5, frames 132): CUDEVICEPTR +
+  stride, ABGR8 kept. Buffer-type theory ruled out.
+- Current test build `[dali5]` = session+buffers padded to 128x32
+  (3440 % 32 = 16 was never tested; upload stays a real-size subregion,
+  right strip is garbage by design) + `nvof_motion_debug.log` next to the
+  addon (build/session/caps/pitches/handles, first 5 exec failures, first
+  success). If this passes, HW alignment was the INVALID_PARAM trigger.
+- If `[dali5]` still OF5, attach the debug log + next: input/reference order
+  swap, then `apiVer`.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
