@@ -166,7 +166,7 @@ void check_ctx_locked(const char *where)
     {
         logged++;
         char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali16] CTX %s: get=%d cur=%p expected=%p", where,
+        snprintf(buf, sizeof(buf), "[dali17] CTX %s: get=%d cur=%p expected=%p", where,
                  static_cast<int>(g), cur, g_cu_ctx);
         dbglog(buf);
     }
@@ -192,17 +192,15 @@ uint64_t g_skips = 0;
 
 uint32_t g_frame_w = 0, g_frame_h = 0;
 
-// OpenCV-faithful: CUDEVICEPTR buffers + driver stride (not CUarray).
+// Stock default recipe (AppOFCuda main defaults): CUARRAY buffers.
 NvOFGPUBufferHandle g_input_bufs[2] = { nullptr, nullptr };
-CUdeviceptr g_input_ptrs[2] = { 0, 0 };
-uint32_t g_input_pitch[2] = { 0, 0 };
+CUarray g_input_arrays[2] = { nullptr, nullptr };
 std::vector<uint8_t> g_gray; // RGBA->luma staging (session-pitched rows)
 uint32_t g_gray_pitch = 0;
 
 // ---- phase 2b: execute output + conversion + exposure ----
 NvOFGPUBufferHandle g_out_buf = nullptr;
-CUdeviceptr g_out_ptr = 0; // SHORT2 flow vectors (S10.5) at grid size
-uint32_t g_out_pitch = 0;
+CUarray g_out_array = nullptr; // SHORT2 flow vectors (S10.5) at grid size
 std::vector<int16_t> g_of_cpu; // int16 pairs, array->host staging for convert
 NV_OF_ROI_RECT g_roi = {}; // diagnostic full-frame ROI (OF5 bisection)
 CUmodule g_ptx_mod = nullptr;  // reserved for the PTX fast path (unused now)
@@ -354,14 +352,12 @@ void destroy_of_locked()
         if (g_input_bufs[i] != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
             g_of.nvOFDestroyGPUBufferCuda(g_input_bufs[i]);
         g_input_bufs[i] = nullptr;
-        g_input_ptrs[i] = 0;
-        g_input_pitch[i] = 0;
+        g_input_arrays[i] = nullptr;
     }
     if (g_out_buf != nullptr && g_of.nvOFDestroyGPUBufferCuda != nullptr)
         g_of.nvOFDestroyGPUBufferCuda(g_out_buf);
     g_out_buf = nullptr;
-    g_out_ptr = 0;
-    g_out_pitch = 0;
+    g_out_array = nullptr;
     if (g_of_handle != nullptr && g_of.nvOFDestroy != nullptr)
     {
         g_of.nvOFDestroy(g_of_handle);
@@ -510,7 +506,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         // (spec: field only considered when enableExternalHints set).
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
-        init.perfLevel = NV_OF_PERF_LEVEL_SLOW; // FAST never verified on Ada
+        init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM; // stock AppOFCuda default
         // 5.0 REQUIRED: input buffer format has no valid zero default.
         init.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
         // 5.0 predDirection/globalFlow stay 0 = FORWARD/off.
@@ -525,10 +521,14 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
             return false;
         }
 
-        // Bisect streams: skip SetIO entirely (driver default streams =
-        // OpenCV null-stream path). Tests whether our stream handle is poison.
-        // (OpenCV order would be: SetIO AFTER init.)
-        (void)g_stream;
+        // Stock default (AppOFCuda main): SetIO called unconditionally,
+        // here with null streams (their useCudaStream=0 default).
+        st = g_of.nvOFSetIOCudaStreams(hOf, nullptr, nullptr);
+        if (st != NV_OF_SUCCESS)
+        {
+            g_last_of_code = static_cast<int>(st);
+            return false;
+        }
 
         for (int i = 0; i < 2; ++i)
         {
@@ -537,26 +537,17 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
             desc.width = w;
             desc.height = h;
             desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
-            desc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8; // OpenCV-faithful
-            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+            desc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
+            st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY,
                                                &g_input_bufs[i]);
             if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
             {
                 g_last_of_code = static_cast<int>(st);
                 return false;
             }
-            g_input_ptrs[i] = g_of.nvOFGPUBufferGetCUdeviceptr(g_input_bufs[i]);
-            if (g_input_ptrs[i] == 0)
+            g_input_arrays[i] = g_of.nvOFGPUBufferGetCUarray(g_input_bufs[i]);
+            if (g_input_arrays[i] == nullptr)
                 return false;
-            // Driver pitch (OpenCV order); tight fallback (1 byte/px).
-            g_input_pitch[i] = w;
-            if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
-            {
-                NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
-                if (g_of.nvOFGPUBufferGetStrideInfo(g_input_bufs[i], &si) == NV_OF_SUCCESS &&
-                    si.strideInfo[0].strideXInBytes != 0)
-                    g_input_pitch[i] = si.strideInfo[0].strideXInBytes;
-            }
         }
         g_crash_stage = 5;
         NV_OF_BUFFER_DESCRIPTOR odesc = {};
@@ -564,23 +555,15 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         odesc.height = (h + kOutGrid - 1) / kOutGrid;
         odesc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
         odesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
-        st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &g_out_buf);
+        st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUARRAY, &g_out_buf);
         if (st != NV_OF_SUCCESS || g_out_buf == nullptr)
         {
             g_last_of_code = static_cast<int>(st);
             return false;
         }
-        g_out_ptr = g_of.nvOFGPUBufferGetCUdeviceptr(g_out_buf);
-        if (g_out_ptr == 0)
+        g_out_array = g_of.nvOFGPUBufferGetCUarray(g_out_buf);
+        if (g_out_array == nullptr)
             return false;
-        g_out_pitch = ((w + kOutGrid - 1) / kOutGrid) * sizeof(int16_t) * 2; // tight fallback
-        if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
-        {
-            NV_OF_CUDA_BUFFER_STRIDE_INFO osi = {};
-            if (g_of.nvOFGPUBufferGetStrideInfo(g_out_buf, &osi) == NV_OF_SUCCESS &&
-                osi.strideInfo[0].strideXInBytes != 0)
-                g_out_pitch = osi.strideInfo[0].strideXInBytes;
-        }
         return true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -604,13 +587,10 @@ bool create_of_locked(uint32_t w, uint32_t h)
             g_of_handle = nullptr;
             g_input_bufs[0] = nullptr;
             g_input_bufs[1] = nullptr;
-            g_input_ptrs[0] = 0;
-            g_input_ptrs[1] = 0;
-            g_input_pitch[0] = 0;
-            g_input_pitch[1] = 0;
+            g_input_arrays[0] = nullptr;
+            g_input_arrays[1] = nullptr;
             g_out_buf = nullptr;
-            g_out_ptr = 0;
-            g_out_pitch = 0;
+            g_out_array = nullptr;
             char code[32] = {};
             snprintf(code, sizeof(code), "0x%08X", static_cast<unsigned int>(g_last_of_code));
             const std::string msg = std::string("[NVOF Motion] DRIVER CRASH in bring-up (stage ") +
@@ -675,16 +655,14 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali16] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,SLOW,OF,inGRAY8) caps %u-%u x %u-%u "
+                 "[dali17] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inGRAY8,arr) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
-                 "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
+                 "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
                  g_cap_hmax, g_cap_grids_count,
                  g_cap_grids_list[0], g_cap_grids_list[1], g_cap_grids_list[2], g_cap_grids_list[3],
                  g_cap_grids_list[4], g_cap_grids_list[5], g_cap_grids_list[6], g_cap_grids_list[7],
-                 g_cap_roi, static_cast<unsigned long long>(g_input_ptrs[0]), g_input_pitch[0],
-                 static_cast<unsigned long long>(g_input_ptrs[1]), g_input_pitch[1],
-                 static_cast<unsigned long long>(g_out_ptr), g_out_pitch, g_grid_w, g_grid_h);
+                 g_cap_roi, g_input_arrays[0], g_input_arrays[1], g_out_array, g_grid_w, g_grid_h);
         dbglog(buf);
     }
 
@@ -720,7 +698,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali16] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali17] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1174,7 +1152,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             {
                 sc_logged++;
                 char buf[128] = {};
-                snprintf(buf, sizeof(buf), "[dali16] frame set-current FAILED: %d (ctx=%p)",
+                snprintf(buf, sizeof(buf), "[dali17] frame set-current FAILED: %d (ctx=%p)",
                          static_cast<int>(sc), g_cu_ctx);
                 dbglog(buf);
             }
@@ -1210,9 +1188,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     m.srcMemoryType = CU_MEMORYTYPE_HOST;
     m.srcHost = g_gray.data();
     m.srcPitch = g_gray_pitch;
-    m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
-    m.dstDevice = g_input_ptrs[g_frames_captured % 2];
-    m.dstPitch = g_input_pitch[g_frames_captured % 2];
+    m.dstMemoryType = CU_MEMORYTYPE_ARRAY;
+    m.dstArray = g_input_arrays[g_frames_captured % 2];
     m.WidthInBytes = static_cast<size_t>(w);
     m.Height = h;
     if (cu == CUDA_SUCCESS)
@@ -1226,8 +1203,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             xfer_logged++;
             char buf[192] = {};
             snprintf(buf, sizeof(buf),
-                     "[dali16] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
-                     static_cast<unsigned long long>(m.dstDevice), g_stream);
+                     "[dali17] frame xfer FAILED: cu=%d dstArray=%p stream=%p", static_cast<int>(cu),
+                     m.dstArray, g_stream);
             dbglog(buf);
         }
     }
@@ -1248,7 +1225,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     // Runs synchronously (execute blocks by API design); only when both
     // input buffers hold a frame (from the 2nd captured frame on).
     bool have_vectors = false;
-    if (cu == CUDA_SUCCESS && g_frames_captured >= 1 && g_out_buf != nullptr && g_out_ptr != 0 &&
+    if (cu == CUDA_SUCCESS && g_frames_captured >= 1 && g_out_buf != nullptr && g_out_array != nullptr &&
         !g_of_cpu.empty())
     {
         const int just_filled = static_cast<int>(g_frames_captured % 2);
@@ -1282,7 +1259,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali16] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali17] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1302,9 +1279,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             g_exec_ok = true;
             // SHORT2 vectors -> host (int16 pairs); float convert happens on CPU.
             CUDA_MEMCPY2D d = {};
-            d.srcMemoryType = CU_MEMORYTYPE_DEVICE;
-            d.srcDevice = g_out_ptr;
-            d.srcPitch = g_out_pitch;
+            d.srcMemoryType = CU_MEMORYTYPE_ARRAY;
+            d.srcArray = g_out_array;
             d.dstMemoryType = CU_MEMORYTYPE_HOST;
             d.dstHost = g_of_cpu.data();
             d.dstPitch = static_cast<size_t>(g_grid_w) * sizeof(int16_t) * 2;
@@ -1319,8 +1295,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali16] first execute OK: grid %ux%u outPitch %u",
-                             g_grid_w, g_grid_h, g_out_pitch);
+                    snprintf(buf, sizeof(buf), "[dali17] first execute OK: grid %ux%u",
+                             g_grid_w, g_grid_h);
                     dbglog(buf);
                 }
                 have_vectors = true;
@@ -1517,7 +1493,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali16]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali17]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))

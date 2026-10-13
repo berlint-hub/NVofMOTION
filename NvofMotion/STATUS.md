@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali16]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali17]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -118,10 +118,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Stock defaults verified (`NvOF.h`): temporal ON, cost OFF, hints OFF –
   all identical to ours. The LAST remaining recipe diff: stock
   `Execute(buf[i], buf[i+1])` = input OLDER frame; we had NEWER (dali6+).
-- Current test build `[dali16]` = input/reference back to stock order
-  (input=older). NOTE: flips flow sign vs dali6+ if it ever executes.
-- If `[dali16]` still OF5: run stock AppOFCuda on the rig (machine vs code
-  verdict) or try another driver (617.14 suspect).
+- Current test build `[dali16]` (still OF5): stock input order, no change.
+- Current test build `[dali17]` = exact stock AppOFCuda DEFAULT recipe in
+  one jump: CUARRAY in/out + preset MEDIUM + `SetIO(null,null)` (their
+  useCudaStream=0 path calls SetIO unconditionally). Keeps: apiVer 5.0,
+  grid1, gray, input=older, temporal on. If it passes, narrow down after.
+  If it fails, the verdict is machine/driver – run stock AppOFCuda or
+  change driver (617.14).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
