@@ -107,6 +107,8 @@ NvOFHandle g_of_handle = nullptr;
 
 CUcontext g_cu_ctx = nullptr;
 CUdevice g_cu_device = 0; // for primary-ctx release
+// Bisect output grid size (caps: 1 2 4). kOutGrid=1 = densest, simplest HW path.
+constexpr uint32_t kOutGrid = 1;
 ID3D12Device *g_owner_device = nullptr; // device owning ctx + pipeline
 device *g_api_dev = nullptr;            // for create/destroy of ReShade resources
 bool g_session_active = false;
@@ -164,7 +166,7 @@ void check_ctx_locked(const char *where)
     {
         logged++;
         char buf[256] = {};
-        snprintf(buf, sizeof(buf), "[dali13] CTX %s: get=%d cur=%p expected=%p", where,
+        snprintf(buf, sizeof(buf), "[dali14] CTX %s: get=%d cur=%p expected=%p", where,
                  static_cast<int>(g), cur, g_cu_ctx);
         dbglog(buf);
     }
@@ -503,7 +505,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
-        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_1;
         // OpenCV-faithful: hintGridSize UNDEFINED when external hints off
         // (spec: field only considered when enableExternalHints set).
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
@@ -555,8 +557,8 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         }
         g_crash_stage = 5;
         NV_OF_BUFFER_DESCRIPTOR odesc = {};
-        odesc.width = (w + 3) / 4; // ceil (OpenCV order)
-        odesc.height = (h + 3) / 4;
+        odesc.width = (w + kOutGrid - 1) / kOutGrid; // ceil (OpenCV order)
+        odesc.height = (h + kOutGrid - 1) / kOutGrid;
         odesc.bufferUsage = NV_OF_BUFFER_USAGE_OUTPUT;
         odesc.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
         st = g_of.nvOFCreateGPUBufferCuda(hOf, &odesc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR, &g_out_buf);
@@ -568,7 +570,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
         g_out_ptr = g_of.nvOFGPUBufferGetCUdeviceptr(g_out_buf);
         if (g_out_ptr == 0)
             return false;
-        g_out_pitch = ((w + 3) / 4) * sizeof(int16_t) * 2; // tight fallback
+        g_out_pitch = ((w + kOutGrid - 1) / kOutGrid) * sizeof(int16_t) * 2; // tight fallback
         if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
         {
             NV_OF_CUDA_BUFFER_STRIDE_INFO osi = {};
@@ -658,8 +660,8 @@ bool create_of_locked(uint32_t w, uint32_t h)
     }
 
     // int16 pairs staging for the array->host download (ceil, OpenCV order).
-    g_grid_w = (w + 3) / 4;
-    g_grid_h = (h + 3) / 4;
+    g_grid_w = (w + kOutGrid - 1) / kOutGrid;
+    g_grid_h = (h + kOutGrid - 1) / kOutGrid;
     g_of_cpu.assign(static_cast<size_t>(g_grid_w) * g_grid_h * 2, 0);
     g_gray.assign(static_cast<size_t>(w) * h, 0); // luma staging, session-pitched
     g_gray_pitch = w;
@@ -670,7 +672,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali13] session %ux%u init(grid4,hintUndef,noExt,noCost,SLOW,OF,inGRAY8) caps %u-%u x %u-%u "
+                 "[dali14] session %ux%u init(grid1,hintUndef,noExt,noCost,SLOW,OF,inGRAY8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
                  w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
@@ -714,7 +716,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali13] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali14] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -820,7 +822,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
         reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: readback ok");
         // R16G16F output texture (ReShade-owned) + CPU upload staging (native).
         {
-            const uint32_t gw = (sw + 3) / 4, gh = (sh + 3) / 4;
+            const uint32_t gw = (sw + kOutGrid - 1) / kOutGrid, gh = (sh + kOutGrid - 1) / kOutGrid;
             const resource_desc tdesc(gw, gh, 1, 1, format::r16g16_float, 1, memory_heap::default_,
                                       resource_usage::copy_dest | resource_usage::shader_resource);
             resource out_tex = { 0 };
@@ -1168,7 +1170,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             {
                 sc_logged++;
                 char buf[128] = {};
-                snprintf(buf, sizeof(buf), "[dali13] frame set-current FAILED: %d (ctx=%p)",
+                snprintf(buf, sizeof(buf), "[dali14] frame set-current FAILED: %d (ctx=%p)",
                          static_cast<int>(sc), g_cu_ctx);
                 dbglog(buf);
             }
@@ -1220,7 +1222,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             xfer_logged++;
             char buf[192] = {};
             snprintf(buf, sizeof(buf),
-                     "[dali13] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
+                     "[dali14] frame xfer FAILED: cu=%d dst=0x%llX stream=%p", static_cast<int>(cu),
                      static_cast<unsigned long long>(m.dstDevice), g_stream);
             dbglog(buf);
         }
@@ -1275,7 +1277,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali13] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali14] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1312,7 +1314,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali13] first execute OK: grid %ux%u outPitch %u",
+                    snprintf(buf, sizeof(buf), "[dali14] first execute OK: grid %ux%u outPitch %u",
                              g_grid_w, g_grid_h, g_out_pitch);
                     dbglog(buf);
                 }
@@ -1510,7 +1512,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali13]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali14]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))

@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali13]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali14]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -96,11 +96,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
   GetCurrent matches, yet the first xfer (memcpy) returns CU 201 – the
   retained primary ctx is unusable for direct CUDA calls in this process
   (bring-up NvOF calls work, direct calls don't). Primary hypothesis dead.
-- Current test build `[dali13]` = revert to fresh `cuCtxCreate` (restores
-  CU 0 frames) + `perfLevel` FAST->SLOW (never verified on Ada; DALI 0.0 is
-  SLOW-class). Clean attribution: fresh+FAST already failed in `[dali9]`.
-- If `[dali13]` still OF5, next: driver version check/reinstall, then
-  `apiVer` (gated SDK 5.x headers).
+- Current test build `[dali13]` (still OF5): SLOW preset, no change –
+  preset ruled out.
+- Current test build `[dali14]` = `outGridSize` 4->1 (densest, full-res
+  output 3456x1440; last untested init axis, caps list 1 2 4).
+- If `[dali14]` still OF5: STOP blind bisect. Needed from the rig: driver
+  version (`nvidia-smi`), stock SDK sample result (proves machine vs code),
+  or SDK 5.x headers (your NVIDIA account download) for the `apiVer` bump.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
