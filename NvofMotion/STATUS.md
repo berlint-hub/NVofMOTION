@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-4]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-5]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -147,8 +147,17 @@ buffer – impossible on PCSX2, PS2-era games have none).
   `Flow scale` 0.624 instead of true S10.5 0.03125 (20x). With 0.031 the
   user reads avg ~44px / 90% moving – needs scene context to judge
   (fast gameplay = plausible; static menu = noise-driven).
-- NEXT: user reports what the game shows + whether avg tracks camera pans.
-  Then phase 2c consumer (`MotionVectors` binding already updates).
+- User reports numbers STATIC during real gameplay motion AND pause, only
+  changing on game restart; Enable toggle changes nothing. That is
+  non-response, not noise: with temporal hints ON the corner diverges
+  (-21 -> -201 over ~180 frames) while center stays ~0 – feedback pathology
+  candidate. Stale-upload candidate: post-execute resource states unknown,
+  our COMMON->COPY_* barriers could silently no-op after NVOFA touches
+  the resources (first upload works, rest frozen at first frames).
+- Current test build `[d3d12-5]` = `disableTemporalHints = TRUE` +
+  overlay `Synthetic +8px test` toggle (shifting gradient pair through the
+  SAME upload path; expect constant avg ~8px). Decides: synth ~8px = path
+  healthy (content/noise issue); synth frozen garbage = plumbing broken.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
