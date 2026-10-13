@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali7]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali8]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -78,10 +78,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[dali6]` (still OF5): input/reference swapped, no
   change – order ruled out (driver can't tell; static scene also proves
   content-independence).
-- Current test build `[dali7]` = SetIO skipped entirely (driver default
-  streams = OpenCV null-stream path). Tests a poisoned stream handle.
-  Debug log stays.
-- If `[dali7]` still OF5, next: `apiVer` (SDK 5.x headers).
+- Current test build `[dali7]` (still OF5): SetIO skipped, no change –
+  streams ruled out.
+- Current test build `[dali8]` = input buffers ABGR8 -> GRAYSCALE8 with CPU
+  RGBA->luma staging (OpenCV-faithful; output stays SHORT2). If this passes,
+  packed-RGB input was the INVALID_PARAM trigger.
+- If `[dali8]` still OF5, next: `apiVer` (SDK 5.x headers).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

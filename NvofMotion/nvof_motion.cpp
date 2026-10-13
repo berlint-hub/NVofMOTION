@@ -17,7 +17,7 @@
 // Assumptions (validated at runtime, reported in overlay):
 //  - backbuffer is in PRESENT state at begin_effects (post-present invariant)
 //  - backbuffer format is R8G8B8A8; otherwise idle with status
-//  - NVOF input ABGR8 accepts our RGBA bytes (R/B swapped luma, v1 approx)
+//  - NVOF input GRAYSCALE8 via CPU RGBA->luma (OpenCV-faithful)
 //  - injected target texture (if any) is R16G16F at grid size, sampled as SRV
 
 #include <windows.h>
@@ -168,6 +168,8 @@ uint32_t g_frame_w = 0, g_frame_h = 0;
 NvOFGPUBufferHandle g_input_bufs[2] = { nullptr, nullptr };
 CUdeviceptr g_input_ptrs[2] = { 0, 0 };
 uint32_t g_input_pitch[2] = { 0, 0 };
+std::vector<uint8_t> g_gray; // RGBA->luma staging (session-pitched rows)
+uint32_t g_gray_pitch = 0;
 
 // ---- phase 2b: execute output + conversion + exposure ----
 NvOFGPUBufferHandle g_out_buf = nullptr;
@@ -348,6 +350,9 @@ void teardown_pipeline_locked(bool gpu_idle)
 
     g_of_cpu.clear();
     g_of_cpu.shrink_to_fit();
+    g_gray.clear();
+    g_gray.shrink_to_fit();
+    g_gray_pitch = 0;
     if (g_readback != nullptr)
     {
         const D3D12_RANGE written = { 0, 0 }; // CPU never writes
@@ -494,7 +499,7 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
             desc.width = w;
             desc.height = h;
             desc.bufferUsage = NV_OF_BUFFER_USAGE_INPUT;
-            desc.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
+            desc.bufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8; // OpenCV-faithful
             st = g_of.nvOFCreateGPUBufferCuda(hOf, &desc, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
                                                &g_input_bufs[i]);
             if (st != NV_OF_SUCCESS || g_input_bufs[i] == nullptr)
@@ -505,8 +510,8 @@ bool create_of_nvof_locked(uint32_t w, uint32_t h)
             g_input_ptrs[i] = g_of.nvOFGPUBufferGetCUdeviceptr(g_input_bufs[i]);
             if (g_input_ptrs[i] == 0)
                 return false;
-            // Driver pitch (OpenCV order); tight fallback.
-            g_input_pitch[i] = w * 4;
+            // Driver pitch (OpenCV order); tight fallback (1 byte/px).
+            g_input_pitch[i] = w;
             if (g_of.nvOFGPUBufferGetStrideInfo != nullptr)
             {
                 NV_OF_CUDA_BUFFER_STRIDE_INFO si = {};
@@ -623,6 +628,8 @@ bool create_of_locked(uint32_t w, uint32_t h)
     g_grid_w = (w + 3) / 4;
     g_grid_h = (h + 3) / 4;
     g_of_cpu.assign(static_cast<size_t>(g_grid_w) * g_grid_h * 2, 0);
+    g_gray.assign(static_cast<size_t>(w) * h, 0); // luma staging, session-pitched
+    g_gray_pitch = w;
 
     {
         const std::string msg =
@@ -630,7 +637,7 @@ bool create_of_locked(uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[dali7] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF) caps %u-%u x %u-%u "
+                 "[dali8] session %ux%u init(grid4,hintUndef,noExt,noCost,FAST,OF,inGRAY8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=0x%llX pitch=%u in1=0x%llX pitch=%u | out=0x%llX pitch=%u outgrid=%ux%u",
                  w, h, g_cap_wmin, g_cap_wmax, g_cap_hmin, g_cap_hmax, g_cap_grids_count,
@@ -666,7 +673,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = (h + 31u) & ~31u;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[dali7] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[dali8] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1109,18 +1116,39 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
 
     if (p_cuCtxSetCurrent != nullptr)
         p_cuCtxSetCurrent(g_cu_ctx);
+    // RGBA -> luma staging (OpenCV GRAYSCALE8 path); gray rows are session-pitched.
+    CUresult cu = CUDA_SUCCESS;
+    if (g_gray_pitch == 0 || g_gray.size() < static_cast<size_t>(g_gray_pitch) * h)
+    {
+        cu = CUDA_ERROR_INVALID_VALUE; // session/gray mismatch -> skip frame (loud)
+    }
+    else
+    {
+        uint8_t *gd = g_gray.data();
+        const uint8_t *rb = static_cast<const uint8_t *>(g_readback_ptr);
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            uint8_t *drow = gd + static_cast<size_t>(y) * g_gray_pitch;
+            const uint8_t *srow = rb + static_cast<size_t>(y) * g_readback_pitch;
+            for (uint32_t x = 0; x < w; ++x)
+                drow[x] = static_cast<uint8_t>((77u * srow[4 * x] + 150u * srow[4 * x + 1] +
+                                                29u * srow[4 * x + 2]) >>
+                                               8);
+        }
+    }
     CUDA_MEMCPY2D m = {};
     m.srcXInBytes = 0;
     m.srcY = 0;
     m.srcMemoryType = CU_MEMORYTYPE_HOST;
-    m.srcHost = g_readback_ptr;
-    m.srcPitch = g_readback_pitch;
+    m.srcHost = g_gray.data();
+    m.srcPitch = g_gray_pitch;
     m.dstMemoryType = CU_MEMORYTYPE_DEVICE;
     m.dstDevice = g_input_ptrs[g_frames_captured % 2];
     m.dstPitch = g_input_pitch[g_frames_captured % 2];
-    m.WidthInBytes = static_cast<size_t>(w) * 4;
+    m.WidthInBytes = static_cast<size_t>(w);
     m.Height = h;
-    CUresult cu = p_cuMemcpy2DAsync(&m, g_stream);
+    if (cu == CUDA_SUCCESS)
+        cu = p_cuMemcpy2DAsync(&m, g_stream);
     if (cu == CUDA_SUCCESS)
         cu = p_cuStreamSynchronize(g_stream);
     // Cheap liveness proof: sampled checksum of the captured pixels.
@@ -1172,7 +1200,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[dali7] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[dali8] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in_params.inputFrame, in_params.referenceFrame, out_params.outputBuffer,
@@ -1209,7 +1237,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (g_executes == 1)
                 {
                     char buf[256] = {};
-                    snprintf(buf, sizeof(buf), "[dali7] first execute OK: grid %ux%u outPitch %u",
+                    snprintf(buf, sizeof(buf), "[dali8] first execute OK: grid %ux%u outPitch %u",
                              g_grid_w, g_grid_h, g_out_pitch);
                     dbglog(buf);
                 }
@@ -1407,7 +1435,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali7]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [dali8]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
