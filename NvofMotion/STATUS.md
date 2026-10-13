@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali15]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali16]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -113,13 +113,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
   `NV_OF_INIT_PARAMS::inputBufferFormat` – a field that DOES NOT EXIST in
   2.0. Driver 617.14 (5.x-era) running our apiVer 2.0 session is the prime
   suspect for the deterministic first-execute OF 5.
-- Current test build `[dali15]` = **apiVer 5.0 bump**: CI headers switched
-  to `mbucchia/Optical-Flow-SDK@NvOFInterface` (sparse), `NV_OF_API_VERSION`
-  0x20->0x50 (verify `api=0x50` in debug log), `init.inputBufferFormat =
-  GRAYSCALE8` set; predDirection/globalFlow zero (FORWARD/off); everything
-  else = `[dali14]` (grid1, SLOW, gray, no-SetIO, cur/prev, temporal on).
-  If this passes, the 2.0-compat path was the trigger – then restore
-  grid4+FAST in a follow-up.
+- Current test build `[dali15]` (still OF5, `api=0x50` confirmed): apiVer
+  bump changed nothing – 2.0 and 5.0 paths fail identically.
+- Stock defaults verified (`NvOF.h`): temporal ON, cost OFF, hints OFF –
+  all identical to ours. The LAST remaining recipe diff: stock
+  `Execute(buf[i], buf[i+1])` = input OLDER frame; we had NEWER (dali6+).
+- Current test build `[dali16]` = input/reference back to stock order
+  (input=older). NOTE: flips flow sign vs dali6+ if it ever executes.
+- If `[dali16]` still OF5: run stock AppOFCuda on the rig (machine vs code
+  verdict) or try another driver (617.14 suspect).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
