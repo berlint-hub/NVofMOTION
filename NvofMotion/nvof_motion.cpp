@@ -53,8 +53,8 @@ NvOFCreateInstanceD3D12_fn p_NvOFCreateInstanceD3D12 = nullptr;
 NV_OF_D3D12_API_FUNCTION_LIST g_of12 = {};
 NvOFHandle g_of_handle = nullptr;
 
-// Grid for the D3D12 bring-up (caps list 1 2 4).
-constexpr uint32_t kOutGrid = 1;
+// Production grid (phase 2b target: grid-4 vectors for interpolation).
+constexpr uint32_t kOutGrid = 4;
 ID3D12Device *g_owner_device = nullptr; // game device owning the NvOF session
 device *g_api_dev = nullptr;            // for create/destroy of ReShade resources
 bool g_session_active = false;
@@ -407,10 +407,10 @@ bool create_of_nvof_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
-        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_1;
+        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
-        init.perfLevel = NV_OF_PERF_LEVEL_MEDIUM; // stock AppOFD3D12 default class
+        init.perfLevel = NV_OF_PERF_LEVEL_FAST; // production preset
         init.inputBufferFormat = NV_OF_BUFFER_FORMAT_GRAYSCALE8;
         init.enableExternalHints = NV_OF_FALSE;
         init.enableOutputCost = NV_OF_FALSE;
@@ -729,7 +729,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-2] session %ux%u api=0x%X init(grid1,hintUndef,noExt,noCost,MEDIUM,OF,inR8) caps %u-%u x %u-%u "
+                 "[d3d12-3] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -757,7 +757,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-2] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-3] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1253,7 +1253,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-2] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-3] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1332,7 +1332,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-2] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-3] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             have_vectors = true;
@@ -1514,7 +1514,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-2]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-3]");
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
