@@ -24,7 +24,7 @@ sampler MotionSampler
 };
 sampler MotionSampler
 {
-    Texture = MotionTex;
+    Texture = motion_vectors_tex;
     MinFilter = POINT;
     MagFilter = POINT;
     MipFilter = POINT;
