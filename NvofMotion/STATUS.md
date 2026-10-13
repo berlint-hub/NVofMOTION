@@ -178,13 +178,15 @@ buffer – impossible on PCSX2, PS2-era games have none).
   from `_texture_semantic_bindings` filled by `update_texture_bindings`):
   the effect must declare `texture MotionTex : MotionVectors` (SEMANTIC),
   not `source`. Fixed; retest.
-- Current test build `[d3d12-10]` = PPOM-style in-menu debug view
-  (`ImGui::Image` on our R16G16F SRV, raw R/G = flow XY, checkbox
-  "Show flow texture"). Bypasses the effect/binding path entirely –
-  shows whether the texture really updates. NOTE: overlay
-  "Target '...': not found" is the INJECTION target (needs an effect to
-  declare that texture) – expected, not a bug. The semantic-binding
-  `.fx` path is still unverified on the rig.
+- `[d3d12-10]` in-menu view WORKS: live flow field visible (red/green
+  directions, black static), executes 10520/10521, avg 12.19px / 94.3%.
+  Vectors are real. Overlay "Target: not found" is the INJECTION target
+  (needs an effect-side variable) – expected.
+- PHASE 2c fix: debug `.fx` now DECLARES `texture motion_vectors_tex`
+  (860x360 RG16F) and visualizes the INJECTED copy (PPOM pattern:
+  addon `find_texture_variable` + copy, dims must match grid). Set addon
+  Target texture to exactly `motion_vectors_tex`. Semantic-binding path
+  parked (loader needs file unless semantic resolves – unverified).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
