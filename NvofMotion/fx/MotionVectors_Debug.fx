@@ -7,12 +7,7 @@
 // No #includes needed (self-contained).
 // If the addon is idle/missing, the view stays black.
 
-texture MotionTex : MotionVectors
-{
-    Width = 860;
-    Height = 360;
-    Format = RG16F;
-};
+texture MotionTex : MotionVectors;
 sampler MotionSampler
 {
     Texture = MotionTex;
