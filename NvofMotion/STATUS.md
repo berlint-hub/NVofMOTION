@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-15]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-16]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -222,6 +222,9 @@ buffer – impossible on PCSX2, PS2-era games have none).
   cross-size resample (400x206 grid -> 860x360 target), no timeouts,
   temporal ON healthy. Target name is FREE (any R16G16F texture_2d) –
   the field IS the rename feature, not a fixed contract.
+- Current test build `[d3d12-16]` = Flow scale label documents HW S10.5
+  default 0.031 + orange warning with data multiplier when deviating
+  (scale affects texture data too, not just stats).
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

@@ -779,7 +779,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-15] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-16] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -808,7 +808,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-15] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-16] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1338,7 +1338,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-15] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-16] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1422,7 +1422,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-15] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-16] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 600th execute (regression signal, not spam).
@@ -1441,7 +1441,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-15] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-16] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1670,7 +1670,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-15] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-16] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1772,7 +1772,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-15]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-16]");
 
     {
         const uint64_t now_ms = GetTickCount64();
@@ -1848,12 +1848,18 @@ static void draw_overlay(effect_runtime *)
                     ms_down, ms_conv);
         ImGui::Text("Scene activity: %s", active ? "yes (pixels change)" : "no");
         ImGui::Text("Flow: avg %.2f px, moving %.1f%%, invalid %.1f%%", flow_avg, flow_moving, flow_invalid);
-        if (ImGui::DragFloat("Flow scale (px per unit)", &flow_scale, 0.001f, 0.001f, 1.0f))
+        if (ImGui::DragFloat("Flow scale (px per unit, HW S10.5 default 0.031)", &flow_scale, 0.001f, 0.001f,
+                            1.0f))
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_flow_scale = flow_scale;
             reshade::set_config_value(nullptr, "NVOF", "FlowScale", g_flow_scale);
         }
+        // NVOFA outputs S10.5 fixed point: true pixels = raw / 32.
+        // Anything else scales BOTH the stats and the texture data.
+        if (flow_scale < 0.031f || flow_scale > 0.0315f)
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Custom scale: texture data x%.1f vs true pixels!",
+                               flow_scale * 32.0f);
     }
     if (ImGui::CollapsingHeader("Texture & target", ImGuiTreeNodeFlags_DefaultOpen))
     {
