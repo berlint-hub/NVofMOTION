@@ -8,15 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(RESHADE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../reshade-main" CACHE PATH
     "Root of the crosire/reshade checkout (must contain include/ and deps/)")
 # Root of the NvOF headers (nvOpticalFlowCommon.h and
-# nvOpticalFlowCuda.h). Points at NvOFInterface/ of the mbucchia/Optical-Flow-SDK
+# nvOpticalFlowD3D12.h). Points at NvOFInterface/ of the mbucchia/Optical-Flow-SDK
 # mirror (API 5.0; NVIDIA's own GitHub is stale at 2.0).
 set(NVOF_SDK "${CMAKE_CURRENT_SOURCE_DIR}/../nvof-sdk" CACHE PATH
-    "Root of the NVIDIAOpticalFlowSDK checkout")
-# Root of an installed CUDA toolkit (provides cuda.h for types and nvcc for
-# the PTX kernel - the add-on binds nvcuda.dll explicitly at runtime,
-# no cuda.lib linkage).
-set(CUDA_TOOLKIT_ROOT "$ENV{CUDA_PATH}" CACHE PATH
-    "CUDA toolkit root (cuda.h lives in <root>/include)")
+    "Root of the NvOFInterface headers directory")
 
 set(RESHADE_INCLUDE "${RESHADE_ROOT}/include")
 set(IMGUI_INCLUDE   "${RESHADE_ROOT}/deps/imgui")
@@ -28,61 +23,20 @@ if(NOT EXISTS "${RESHADE_INCLUDE}/reshade.hpp")
 endif()
 if(NOT EXISTS "${NVOF_SDK}/nvOpticalFlowCommon.h")
     message(FATAL_ERROR
-        "Cannot find nvOpticalFlowCommon.h – set NVOF_SDK to the NVIDIAOpticalFlowSDK directory.\n"
+        "Cannot find nvOpticalFlowCommon.h – set NVOF_SDK to the NvOFInterface directory.\n"
         "  Current NVOF_SDK = ${NVOF_SDK}")
 endif()
-if(NOT EXISTS "${CUDA_TOOLKIT_ROOT}/include/cuda.h")
-    message(FATAL_ERROR
-        "Cannot find cuda.h – set CUDA_TOOLKIT_ROOT to an installed CUDA toolkit.\n"
-        "  Current CUDA_TOOLKIT_ROOT = ${CUDA_TOOLKIT_ROOT}")
-endif()
 
-# ── PTX kernel (flow_convert.cu -> flow_ptx.h) ──────────────────────────────
-find_program(NVCC_EXECUTABLE nvcc
-    HINTS "${CUDA_TOOLKIT_ROOT}/bin"
-    NO_DEFAULT_PATH)
-if(NOT NVCC_EXECUTABLE)
-    find_program(NVCC_EXECUTABLE nvcc)
-endif()
-if(NOT NVCC_EXECUTABLE)
-    message(FATAL_ERROR "nvcc not found – needed to compile flow_convert.cu to PTX.")
-endif()
-
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
-    COMMAND "${NVCC_EXECUTABLE}" -ptx
-            "${CMAKE_CURRENT_SOURCE_DIR}/flow_convert.cu"
-            -o "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/flow_convert.cu"
-    COMMENT "Compiling flow_convert.cu to PTX"
-    VERBATIM)
-
-add_custom_command(
-    OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h"
-    COMMAND "${CMAKE_COMMAND}"
-            "-DPTX=${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
-            "-DHEADER=${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_ptx.cmake"
-    DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/flow_convert.ptx"
-            "${CMAKE_CURRENT_SOURCE_DIR}/embed_ptx.cmake"
-    COMMENT "Embedding flow PTX into header"
-    VERBATIM)
-
-add_custom_target(flow_ptx_header DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/flow_ptx.h")
-
-# ── Target ──────────────────────────────────────────────────────────────────
+# ── Target (pure C++, no CUDA: the D3D12 backend binds nvofapi64.dll
+# explicitly at runtime and links nothing) ───────────────────────────────────
 add_library(nvof_motion SHARED
     nvof_motion.cpp
 )
-
-add_dependencies(nvof_motion flow_ptx_header)
 
 target_include_directories(nvof_motion PRIVATE
     ${RESHADE_INCLUDE}
     ${IMGUI_INCLUDE}
     ${NVOF_SDK}
-    ${CUDA_TOOLKIT_ROOT}/include
-    ${CMAKE_CURRENT_BINARY_DIR}
 )
 
 target_compile_definitions(nvof_motion PRIVATE

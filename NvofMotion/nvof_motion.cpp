@@ -189,6 +189,7 @@ uint64_t g_executes = 0;
 
 uint64_t g_frames_captured = 0;
 uint64_t g_memcpys_done = 0;
+uint64_t g_pair_idx = 0; // ping-pong/upload index, reset per session (frames_* are stats)
 int g_last_of_code = 0;
 bool g_synth_test = false; // overlay toggle: synthetic +8px pair instead of game frames
 bool g_show_tex = false; // overlay toggle: debug view of the flow texture (PPOM-style)
@@ -215,16 +216,19 @@ void set_status_locked(const char *text, reshade::log::level level)
 }
 
 // Blocking CPU wait on a fence value (stock AppOFD3D12 pattern).
-void wait_fence_value(ID3D12Fence *fence, uint64_t value)
+// Returns false on timeout (caller recovers: skip frame / teardown).
+bool wait_fence_ms(ID3D12Fence *fence, uint64_t value, DWORD timeout_ms)
 {
     if (fence == nullptr || fence->GetCompletedValue() >= value)
-        return;
+        return true;
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (ev == nullptr)
-        return;
+        return false;
+    bool ok = false;
     if (SUCCEEDED(fence->SetEventOnCompletion(value, ev)))
-        WaitForSingleObject(ev, INFINITE);
+        ok = WaitForSingleObject(ev, timeout_ms) == WAIT_OBJECT_0;
     CloseHandle(ev);
+    return ok;
 }
 
 // Round-nearest-ish float -> IEEE half bits (for R16G16F upload staging).
@@ -282,7 +286,9 @@ bool resolve_nvof_locked()
 // Destroys NvOF session (unregister first!) + D3D12 resources + NvOF fences.
 void destroy_of_locked()
 {
-    for (int i = 0; i < 2; ++i)
+    // Drain NVOFA first: the engine may still read the buffers we are about
+    // to unregister (wait_idle only drains the game queue, not NVOFA).
+    wait_fence_ms(g_ofa_fence, g_ofa_val, INFINITE);    for (int i = 0; i < 2; ++i)
     {
         if (g_in_bufs[i] != nullptr && g_of12.nvOFUnregisterResourceD3D12 != nullptr)
         {
@@ -773,7 +779,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-14] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-15] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -786,6 +792,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
 
     g_last_of_error.clear();
     g_exec_ok = true;
+    g_pair_idx = 0; // fresh buffers: first frame uploads only, no half-zero pair
     g_session_active = true;
     return true;
 }
@@ -801,7 +808,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-14] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-15] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1176,9 +1183,11 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     // RGBA -> luma staging (unchanged); then upload into the registered R8 input.
     // Synthetic self-test (overlay toggle): shifting pattern, constant +8px flow.
     // High-contrast 8px checker (FAST-trackable; smooth gradients go blind).
+    // Checksum accumulates in the same pass (scene-activity detection).
+    uint64_t sum = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
     if (g_synth_test)
     {
-        const int dx = static_cast<int>((8u * static_cast<uint32_t>(g_frames_captured)) % w);
+        const int dx = static_cast<int>((8u * static_cast<uint32_t>(g_pair_idx)) % w);
         uint8_t *gd = g_gray.data();
         for (uint32_t y = 0; y < h; ++y)
         {
@@ -1194,6 +1203,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (t > 255)
                     t = 255;
                 drow[x] = static_cast<uint8_t>(t);
+                sum ^= drow[x];
+                sum *= 1099511628211ULL;
             }
         }
     }
@@ -1211,26 +1222,16 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             uint8_t *drow = gd + static_cast<size_t>(y) * g_gray_pitch;
             const uint8_t *srow = rb + static_cast<size_t>(y) * g_readback_pitch;
             for (uint32_t x = 0; x < w; ++x)
+            {
                 drow[x] = static_cast<uint8_t>((77u * srow[4 * x] + 150u * srow[4 * x + 1] +
                                                 29u * srow[4 * x + 2]) >>
                                                8);
-        }
-    }
-    const int fill_idx = static_cast<int>(g_frames_captured % 2);
-    // Liveness checksum over the luma staging (what NVOFA actually sees).
-    uint64_t sum = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
-    {
-        const uint8_t *gd = g_gray.data();
-        for (uint32_t y = 0; y < h; ++y)
-        {
-            const uint8_t *row = gd + static_cast<size_t>(y) * g_gray_pitch;
-            for (uint32_t x = 0; x < w; ++x)
-            {
-                sum ^= row[x];
-                sum *= 1099511628211ULL; // FNV-1a prime
+                sum ^= drow[x];
+                sum *= 1099511628211ULL;
             }
         }
     }
+    const int fill_idx = static_cast<int>(g_pair_idx % 2);
     // Upload: gray rows -> mapped UPLOAD staging -> registered R8 input (own list).
     {
         uint8_t *dst = static_cast<uint8_t *>(g_in_up_ptr[fill_idx]);
@@ -1284,14 +1285,18 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         native_queue->ExecuteCommandLists(1, lists);
         native_queue->Signal(g_app_fence, ++g_app_val);
     }
-    wait_fence_value(g_app_fence, g_app_val); // upload copy done (blocking, ~instant)
+    if (!wait_fence_ms(g_app_fence, g_app_val, 1000)) // upload copy done
+    {
+        set_status_locked("NvOF upload fence timeout, skipping frame", reshade::log::level::warning);
+        return;
+    }
     g_ms_up = ms_since(t_up0);
 
     // ---- NvOF D3D12 execute on pair (prev, cur), convert on CPU, stats ----
     // Fully synchronous frames (blocking fence waits); only when both
     // input resources hold a frame (from the 2nd captured frame on).
     bool have_vectors = false;
-    if (g_frames_captured >= 1 && g_in_bufs[0] != nullptr && g_in_bufs[1] != nullptr &&
+    if (g_pair_idx >= 1 && g_in_bufs[0] != nullptr && g_in_bufs[1] != nullptr &&
         g_out_buf != nullptr && !g_of_cpu.empty())
     {
         const int just_filled = fill_idx;
@@ -1333,7 +1338,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-14] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-15] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1398,7 +1403,11 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 native_queue->Signal(g_fence, ++g_fence_value);
             }
             g_fence->SetEventOnCompletion(g_fence_value, g_frame_event);
-            WaitForSingleObject(g_frame_event, INFINITE); // download done (stock pattern)
+            if (WaitForSingleObject(g_frame_event, 1000) != WAIT_OBJECT_0) // download done
+            {
+                set_status_locked("NvOF download fence timeout, skipping frame", reshade::log::level::warning);
+                return;
+            }
             {
                 const uint8_t *src = static_cast<const uint8_t *>(g_out_down_ptr) + g_out_foot.Offset;
                 const uint32_t pitch = g_out_foot.Footprint.RowPitch;
@@ -1413,11 +1422,11 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-14] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-15] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
-            // Vector telemetry every 60th execute: frozen vs live data?
-            if ((g_executes % 60) == 1)
+            // Vector telemetry every 600th execute (regression signal, not spam).
+            if ((g_executes % 600) == 1)
             {
                 const size_t cx = g_grid_w / 2, cy = g_grid_h / 2;
                 const size_t ci = (cy * g_grid_w + cx) * 2;
@@ -1432,7 +1441,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-14] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-15] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1448,6 +1457,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     g_last_checksum = sum;
     g_frames_captured++;
     g_memcpys_done++;
+    g_pair_idx++;
 
     // ---- CPU: int16 -> half into upload staging + stats; 2nd list ----
     if (have_vectors && g_upload_ptr != nullptr && g_out_tex.handle != 0 && g_out_srv.handle != 0)
@@ -1660,7 +1670,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-14] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-15] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1762,7 +1772,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-14]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-15]");
 
     {
         const uint64_t now_ms = GetTickCount64();

@@ -15,9 +15,9 @@ local builds and for anyone who wants to reuse the code.
 ## Build prerequisites
 
 - Visual Studio 2022 (MSVC v143) + CMake >= 3.24
-- CUDA Toolkit 12.x (for `cuda.h` + `nvcc`; the add-on binds `nvcuda.dll`
-  at runtime and links nothing, the probe links `cuda.lib`; installer sets
-  `CUDA_PATH`, which CMake picks up)
+- CUDA Toolkit 12.x (only the probe links `cuda.lib`; the add-on is pure
+  C++ and binds `nvofapi64.dll` at runtime – no `nvcc`/PTX step anymore.
+  The installer sets `CUDA_PATH`, which the probe build picks up)
 - ReShade headers: `git clone https://github.com/crosire/reshade`
   (needs submodules for the overlay: `deps/imgui`)
 - NvOF headers, API 5.0: `NvOFInterface/` from

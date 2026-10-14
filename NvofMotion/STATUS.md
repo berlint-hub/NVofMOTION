@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-14]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-15]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -212,6 +212,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Current test build `[d3d12-14]` = resolution-independent injection:
   nearest-neighbor resample grid -> ANY R16G16 target dims (own staging,
   realloc on change, invalid->0). No Reload needed after resize.
+- Current test build `[d3d12-15]` = safety + hygiene batch: 1s-timeout
+  fence waits with frame-skip recovery (no more INFINITE hangs),
+  NVOFA drain before unregister, `pair_idx` reset per session (no more
+  half-zero first pair after resize), fused gray+checksum pass, vec
+  telemetry 1/600, dead PTX build removed (addon is pure C++ now),
+  `paths-ignore: **.md` in CI.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
