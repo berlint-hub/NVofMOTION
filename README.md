@@ -16,3 +16,6 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
 Status: **phase 2b + 2c working** – native D3D12 NvOF session (grid4/FAST),
 R16G16F `MotionVectors` field + injection into `motion_vectors_tex`.
+
+![Addon overlay with live stats and flow preview](NvofMotion/docs/overlay-addon.png)
+![Flow field visualization in game (direction = hue, magnitude = brightness)](NvofMotion/docs/flow-visualization.png)
