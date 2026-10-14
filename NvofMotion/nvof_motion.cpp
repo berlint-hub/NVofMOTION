@@ -782,7 +782,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-17] session %ux%u api=0x%X init(grid%u,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-18] session %ux%u api=0x%X init(grid%u,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_out_grid, g_cap_wmin, g_cap_wmax,
@@ -812,7 +812,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-17] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-18] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1344,7 +1344,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-17] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-18] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1428,7 +1428,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-17] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-18] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 600th execute (regression signal, not spam).
@@ -1447,7 +1447,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-17] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-18] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1471,7 +1471,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         const auto t_cv0 = std::chrono::steady_clock::now();
         const size_t total = static_cast<size_t>(g_grid_w) * g_grid_h;
         double acc = 0.0;
-        size_t moving = 0, invalid = 0, valid = 0;
+        size_t moving = 0, invalid = 0, nsamp = 0;
         for (size_t i = 0; i < total; ++i)
         {
             // S10.5 hardware units -> px (g_flow_scale, default 1/32).
@@ -1490,14 +1490,18 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 ++invalid;
                 continue;
             }
-            ++valid;
+            // Stats on a 1/16 subsample (every 4th row/col): sqrt is the
+            // hottest op here (5M/frame at grid1), texture stays full-res.
+            if (((row | col) & 3u) != 0)
+                continue;
+            ++nsamp;
             const double len = sqrt(static_cast<double>(fx) * fx + static_cast<double>(fy) * fy);
             acc += len;
             if (len > 0.5)
                 ++moving;
         }
-        g_flow_avg = static_cast<float>(acc / (valid != 0 ? valid : 1));
-        g_flow_moving_pct = 100.0f * static_cast<float>(moving) / static_cast<float>(total != 0 ? total : 1);
+        g_flow_avg = static_cast<float>(acc / (nsamp != 0 ? nsamp : 1));
+        g_flow_moving_pct = 100.0f * static_cast<float>(moving) / static_cast<float>(nsamp != 0 ? nsamp : 1);
         g_flow_invalid_pct = 100.0f * static_cast<float>(invalid) / static_cast<float>(total != 0 ? total : 1);
 
         if (SUCCEEDED(g_cmd_alloc->Reset()) && SUCCEEDED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
@@ -1676,7 +1680,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-17] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-18] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1778,7 +1782,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-17]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-18]");
 
     {
         const uint64_t now_ms = GetTickCount64();

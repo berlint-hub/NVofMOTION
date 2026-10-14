@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-17]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-18]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -224,11 +224,12 @@ buffer – impossible on PCSX2, PS2-era games have none).
   the field IS the rename feature, not a fixed contract.
 - `[d3d12-16]` = Flow scale label documents HW S10.5 default 0.031 +
   orange warning with data multiplier when deviating.
-- Current test build `[d3d12-17]` = output grid switch 1/2/4 in overlay
-  (default 4, persisted, rebuilds session; all geometry already
-  parameterized). Full-res grid1 is overkill for interpolation (AAA use
-  rasterized per-pixel velocity + reduced-res optical flow) – compare
-  visually via the debug fx.
+- `[d3d12-17]` = output grid switch 1/2/4 in overlay (default 4,
+  persisted, rebuilds session; all geometry already parameterized).
+- Current test build `[d3d12-18]` = stats on 1/16 subsample (every 4th
+  row/col; `sqrt` was the hottest op – 5M/frame at grid1 tanked FPS while
+  GPU idled at 20-30%). Texture convert stays full-res; avg/moving use
+  sampled denominators (unbiased), invalid stays exact.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
