@@ -23,6 +23,7 @@
 #include <windows.h>
 #include <d3d12.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -91,6 +92,30 @@ void dbglog(const char *line)
     std::lock_guard<std::mutex> lock(log_mutex);
     if (g_dbglog_path[0] == L'\0')
         return;
+    // Log rotation (once): cap at 2 MB, then start fresh.
+    {
+        static bool rotated = false;
+        if (!rotated)
+        {
+            rotated = true;
+            WIN32_FILE_ATTRIBUTE_DATA attr = {};
+            if (GetFileAttributesExW(g_dbglog_path, GetFileExInfoStandard, &attr) != FALSE)
+            {
+                const uint64_t size =
+                    (static_cast<uint64_t>(attr.nFileSizeHigh) << 32) | attr.nFileSizeLow;
+                if (size > 2u * 1024u * 1024u)
+                {
+                    DeleteFileW(g_dbglog_path);
+                    FILE *h = nullptr;
+                    if (_wfopen_s(&h, g_dbglog_path, L"a") == 0 && h != nullptr)
+                    {
+                        fputs("[log rotated: previous file exceeded 2 MB]\n", h);
+                        fclose(h);
+                    }
+                }
+            }
+        }
+    }
     FILE *f = nullptr;
     if (_wfopen_s(&f, g_dbglog_path, L"a") != 0 || f == nullptr)
         return;
@@ -162,6 +187,9 @@ uint64_t g_memcpys_done = 0;
 int g_last_of_code = 0;
 bool g_synth_test = false; // overlay toggle: synthetic +8px pair instead of game frames
 bool g_show_tex = false; // overlay toggle: debug view of the flow texture (PPOM-style)
+// QoL: stall watchdog + per-stage timings (all under g_mutex).
+uint64_t g_last_frame_ms = 0; // GetTickCount64 at last begin_effects
+double g_ms_cap = 0.0, g_ms_up = 0.0, g_ms_exec = 0.0, g_ms_down = 0.0, g_ms_conv = 0.0;
 std::string g_last_of_error; // nvOFGetLastError text for the last execute failure
 // SEH forensics: which bring-up stage crashed + exception code (0 = no crash).
 int g_crash_stage = 0;
@@ -732,7 +760,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-12] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-13] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -760,7 +788,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-12] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-13] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1069,7 +1097,13 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         set_status_locked("capture pipeline active", reshade::log::level::info);
     }
 
+    g_last_frame_ms = GetTickCount64(); // stall watchdog: frames are flowing
+    const auto ms_since = [](const std::chrono::steady_clock::time_point &t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    };
+
     // ---- per-frame: copy bb -> readback, fence, poll, HtoD memcpy ----
+    const auto t_cap0 = std::chrono::steady_clock::now();
     ID3D12Resource *bb_res = reinterpret_cast<ID3D12Resource *>(bb.handle);
 
     if (FAILED(g_cmd_alloc->Reset()) || FAILED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
@@ -1123,6 +1157,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         g_skips++;
         return;
     }
+    g_ms_cap = ms_since(t_cap0);
+    const auto t_up0 = std::chrono::steady_clock::now();
 
     // RGBA -> luma staging (unchanged); then upload into the registered R8 input.
     // Synthetic self-test (overlay toggle): shifting pattern, constant +8px flow.
@@ -1236,6 +1272,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         native_queue->Signal(g_app_fence, ++g_app_val);
     }
     wait_fence_value(g_app_fence, g_app_val); // upload copy done (blocking, ~instant)
+    g_ms_up = ms_since(t_up0);
 
     // ---- NvOF D3D12 execute on pair (prev, cur), convert on CPU, stats ----
     // Fully synchronous frames (blocking fence waits); only when both
@@ -1263,7 +1300,10 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
         outFp.fence = g_ofa_fence;
         outFp.value = ++g_ofa_val;
         out12.fencePoint = &outFp;
+        const auto t_ex0 = std::chrono::steady_clock::now();
         const NV_OF_STATUS ost = g_of12.nvOFExecuteD3D12(g_of_handle, &in12, &out12);
+        g_ms_exec = ms_since(t_ex0);
+        const auto t_dn0 = std::chrono::steady_clock::now();
         if (ost != NV_OF_SUCCESS)
         {
             g_last_of_code = static_cast<int>(ost);
@@ -1280,7 +1320,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-12] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-13] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1355,11 +1395,12 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     std::memcpy(dst + static_cast<size_t>(y) * g_grid_w * 2,
                                 src + static_cast<size_t>(y) * pitch, rowbytes);
             }
+            g_ms_down = ms_since(t_dn0);
             g_executes++;
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-12] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-13] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 60th execute: frozen vs live data?
@@ -1378,7 +1419,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-12] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-13] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1398,6 +1439,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     // ---- CPU: int16 -> half into upload staging + stats; 2nd list ----
     if (have_vectors && g_upload_ptr != nullptr && g_out_tex.handle != 0 && g_out_srv.handle != 0)
     {
+        const auto t_cv0 = std::chrono::steady_clock::now();
         const size_t total = static_cast<size_t>(g_grid_w) * g_grid_h;
         double acc = 0.0;
         size_t moving = 0, invalid = 0, valid = 0;
@@ -1522,7 +1564,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-12] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-13] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float %ux%u)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1548,6 +1590,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 native_queue->ExecuteCommandLists(1, lists2);
                 runtime->update_texture_bindings("MotionVectors", g_out_srv, g_out_srv);
             }
+            g_ms_conv = ms_since(t_cv0);
         }
     }
 }
@@ -1566,6 +1609,9 @@ static void draw_overlay(effect_runtime *)
     float flow_avg = 0.0f, flow_moving = 0.0f, flow_scale = 0.0f, flow_invalid = 0.0f;
     char target_tex[128] = {};
     int last_of = 0;
+    double ms_cap = 0.0, ms_up = 0.0, ms_exec = 0.0, ms_down = 0.0, ms_conv = 0.0;
+    uint64_t last_frame_ms = 0;
+    bool synth_test = false;
     bool show_tex = false;
     uint64_t flow_srv = 0;
     uint32_t gw = 0, gh = 0;
@@ -1599,6 +1645,13 @@ static void draw_overlay(effect_runtime *)
         flow_scale = g_flow_scale;
         last_of = g_last_of_code;
         show_tex = g_show_tex;
+        synth_test = g_synth_test;
+        ms_cap = g_ms_cap;
+        ms_up = g_ms_up;
+        ms_exec = g_ms_exec;
+        ms_down = g_ms_down;
+        ms_conv = g_ms_conv;
+        last_frame_ms = g_last_frame_ms;
         flow_srv = g_out_srv.handle;
         gw = g_grid_w;
         gh = g_grid_h;
@@ -1614,7 +1667,15 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-12]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-13]");
+
+    {
+        const uint64_t now_ms = GetTickCount64();
+        if (session && last_frame_ms != 0 && now_ms - last_frame_ms > 2000)
+            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.2f, 1.0f),
+                               "STALLED: no frames for %llus - check the ReShade effects toggle!",
+                               static_cast<unsigned long long>((now_ms - last_frame_ms) / 1000));
+    }
 
     bool enabled = g_enabled != 0;
     if (ImGui::Checkbox("Enable", &enabled))
@@ -1629,11 +1690,12 @@ static void draw_overlay(effect_runtime *)
         }
     }
     {
-        bool synth = g_synth_test;
+        bool synth = synth_test;
         if (ImGui::Checkbox("Synthetic +8px test (self-test)", &synth))
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_synth_test = synth;
+            reshade::set_config_value(nullptr, "NVOF", "SynthTest", synth ? 1u : 0u);
         }
     }
     {
@@ -1642,6 +1704,7 @@ static void draw_overlay(effect_runtime *)
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_show_tex = show;
+            reshade::set_config_value(nullptr, "NVOF", "ShowTex", show ? 1u : 0u);
         }
     }
     if (show_tex && flow_srv != 0 && gw > 0 && gh > 0)
@@ -1652,48 +1715,65 @@ static void draw_overlay(effect_runtime *)
         ImGui::Image((ImTextureID)flow_srv, ImVec2(disp_w, disp_h));
     }
 
-    ImGui::Text("D3D12 device seen: %s", d3d12_seen ? "yes" : "no");
-    ImGui::Text("NvOF session: %s", session ? "active" : "inactive");
-    if (caps_ok)
+    if (ImGui::CollapsingHeader("Session & caps", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Text("Caps: %ux%u .. %ux%u, out grids mask 0x%X", wmin, hmin, wmax, hmax, grids);
-        if (grids_count > 0)
+        ImGui::Text("D3D12 device seen: %s", d3d12_seen ? "yes" : "no");
+        ImGui::Text("NvOF session: %s", session ? "active" : "inactive");
+        if (caps_ok)
         {
-            std::string gs = "Grids:";
-            for (uint32_t i = 0; i < grids_count; ++i)
-                gs += " " + std::to_string(grids_list[i]);
-            gs += " | ROI support: " + std::to_string(cap_roi);
-            ImGui::TextUnformatted(gs.c_str());
+            ImGui::Text("Caps: %ux%u .. %ux%u, out grids mask 0x%X", wmin, hmin, wmax, hmax, grids);
+            if (grids_count > 0)
+            {
+                std::string gs = "Grids:";
+                for (uint32_t i = 0; i < grids_count; ++i)
+                    gs += " " + std::to_string(grids_list[i]);
+                gs += " | ROI support: " + std::to_string(cap_roi);
+                ImGui::TextUnformatted(gs.c_str());
+            }
+        }
+        if (fw != 0)
+            ImGui::Text("Session: %ux%u, grid %ux%u", fw, fh, gw, gh);
+    }
+    if (ImGui::CollapsingHeader("Capture & flow", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        if (fw != 0)
+            ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu, skips %llu, executes %llu", fw, fh,
+                        frames, memcpys, skips, executes);
+        ImGui::Text("Times ms: cap %.2f up %.2f exec %.2f down %.2f conv %.2f", ms_cap, ms_up, ms_exec,
+                    ms_down, ms_conv);
+        ImGui::Text("Scene activity: %s", active ? "yes (pixels change)" : "no");
+        ImGui::Text("Flow: avg %.2f px, moving %.1f%%, invalid %.1f%%", flow_avg, flow_moving, flow_invalid);
+        if (ImGui::DragFloat("Flow scale (px per unit)", &flow_scale, 0.001f, 0.001f, 1.0f))
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_flow_scale = flow_scale;
+            reshade::set_config_value(nullptr, "NVOF", "FlowScale", g_flow_scale);
         }
     }
-    if (fw != 0)
-        ImGui::Text("Capture: %ux%u, frames %llu, memcpys %llu, skips %llu, executes %llu", fw, fh, frames,
-                    memcpys, skips, executes);
-    ImGui::Text("Scene activity: %s", active ? "yes (pixels change)" : "no");
-    ImGui::Text("Flow: avg %.2f px, moving %.1f%%, invalid %.1f%%", flow_avg, flow_moving, flow_invalid);
-    if (ImGui::DragFloat("Flow scale (px per unit)", &flow_scale, 0.001f, 0.001f, 1.0f))
+    if (ImGui::CollapsingHeader("Texture & target", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        g_flow_scale = flow_scale;
-        reshade::set_config_value(nullptr, "NVOF", "FlowScale", g_flow_scale);
-    }
-    if (ImGui::InputText("Target texture (empty = off)", target_tex, sizeof(target_tex)))
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        if (ImGui::InputText("Target texture (empty = off)", target_tex, sizeof(target_tex)))
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
 #if defined(_MSC_VER)
-        strncpy_s(g_target_tex, target_tex, sizeof(g_target_tex) - 1);
+            strncpy_s(g_target_tex, target_tex, sizeof(g_target_tex) - 1);
 #else
-        strncpy(g_target_tex, target_tex, sizeof(g_target_tex) - 1);
+            strncpy(g_target_tex, target_tex, sizeof(g_target_tex) - 1);
 #endif
-        g_target_tex[sizeof(g_target_tex) - 1] = '\0';
-        reshade::set_config_value(nullptr, "NVOF", "TargetTexture", g_target_tex);
+            g_target_tex[sizeof(g_target_tex) - 1] = '\0';
+            reshade::set_config_value(nullptr, "NVOF", "TargetTexture", g_target_tex);
+        }
+        if (target_tex[0] != '\0')
+            ImGui::Text("Target '%s': %s", target_tex,
+                        target_ok ? "injected" : (target_found ? "found" : "not found"));
     }
-    if (target_tex[0] != '\0')
-        ImGui::Text("Target '%s': %s", target_tex, target_ok ? "injected" : (target_found ? "found" : "not found"));
-    ImGui::Text("Last code: OF %d", last_of);
-    if (!last_of_err.empty())
-        ImGui::TextWrapped("OF detail: %s", last_of_err.c_str());
-    ImGui::TextWrapped("%s", status.c_str());
+    if (ImGui::CollapsingHeader("Debug", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Text("Last code: OF %d", last_of);
+        if (!last_of_err.empty())
+            ImGui::TextWrapped("OF detail: %s", last_of_err.c_str());
+        ImGui::TextWrapped("%s", status.c_str());
+    }
 }
 
 static void register_addon_nvof()
@@ -1730,6 +1810,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             reshade::get_config_value(nullptr, "NVOF", "FlowScale", flow_scale);
             if (flow_scale > 0.0f)
                 g_flow_scale = flow_scale;
+        }
+        {
+            unsigned int v = g_synth_test ? 1u : 0u;
+            reshade::get_config_value(nullptr, "NVOF", "SynthTest", v);
+            g_synth_test = v != 0;
+        }
+        {
+            unsigned int v = g_show_tex ? 1u : 0u;
+            reshade::get_config_value(nullptr, "NVOF", "ShowTex", v);
+            g_show_tex = v != 0;
         }
         {
             char tgt[sizeof(g_target_tex)] = {};

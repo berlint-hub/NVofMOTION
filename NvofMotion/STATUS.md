@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-12]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-13]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -178,6 +178,11 @@ buffer – impossible on PCSX2, PS2-era games have none).
   native, grid4/FAST) -> R16G16F field -> effect texture -> shader.
   INT16_MIN invalids filtered, telemetry + self-test + in-menu view stay
   as regression tools.
+- Current test build `[d3d12-13]` = QoL batch: STALL watchdog (red warning
+  when no frames >2s – the effects-toggle lesson), per-stage ms timings
+  (`Times ms: cap/up/exec/down/conv` – answers the GPU-cost question with
+  data), debug-log rotation at 2 MB, `Session: WxH, grid GxG` row, persisted
+  SynthTest/ShowTex checkboxes, collapsible overlay sections.
 - Windowed mode black: debug `.fx` had hardcoded 860x360 (fullscreen
   grid4) but windowed grid is 430x324 – addon correctly skipped the copy
   (dims guard). Fixed with dynamic dims `(BUFFER_WIDTH+3)/4` (same ceil
