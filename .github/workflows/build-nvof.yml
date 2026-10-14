@@ -1,0 +1,123 @@
+name: build / NVOF Motion (.addon64)
+
+# Phase 1b: ReShade headers + NvOF headers + CUDA toolkit headers.
+# No CUDA/NvOF libraries are linked (both bound explicitly at runtime).
+# Builds NvofMotion/nvof_motion.cpp -> nvof_motion.addon64 (x64).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'NvofMotion/**'
+      - '.github/workflows/build-nvof.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'NvofMotion/**'
+      - '.github/workflows/build-nvof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-addon64:
+    name: NVOF Motion · x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout NVofMOTION (branch main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Checkout reshade headers (crosire/reshade)
+        uses: actions/checkout@v4
+        with:
+          repository: crosire/reshade
+          ref: main
+          path: reshade-main
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Checkout NvOF headers (mbucchia/Optical-Flow-SDK mirror, API 5.0)
+        uses: actions/checkout@v4
+        with:
+          repository: mbucchia/Optical-Flow-SDK
+          path: nvof-sdk
+          fetch-depth: 1
+          sparse-checkout: |
+            NvOFInterface
+          sparse-checkout-cone-mode: false
+
+      - name: Install CUDA toolkit (headers only; nothing linked)
+        uses: Jimver/cuda-toolkit@v0.2.36
+        id: cuda-toolkit
+        with:
+          cuda: '12.6.0'
+          method: 'network'
+
+      - name: Debug CUDA install
+        shell: pwsh
+        run: |
+          Write-Host "CUDA_PATH = $env:CUDA_PATH"
+          if (Test-Path "$env:CUDA_PATH/include/cuda.h") { Write-Host "cuda.h present" } else { Write-Host "cuda.h MISSING"; exit 1 }
+          Get-ChildItem "$env:CUDA_PATH" | Select-Object Name
+
+      - name: Verify inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "reshade-main/include/reshade.hpp")) { throw "missing reshade-main/include/reshade.hpp" }
+          if (-not (Test-Path "reshade-main/deps/imgui/imgui.h")) { throw "missing reshade-main/deps/imgui/imgui.h (submodules?)" }
+          if (-not (Test-Path "nvof-sdk/NvOFInterface/nvOpticalFlowCommon.h")) { throw "missing nvof-sdk/NvOFInterface/nvOpticalFlowCommon.h" }
+          if (-not (Test-Path "nvof-sdk/NvOFInterface/nvOpticalFlowCuda.h")) { throw "missing nvof-sdk/NvOFInterface/nvOpticalFlowCuda.h" }
+          if (-not (Test-Path "NvofMotion/nvof_motion.cpp")) { throw "missing NvofMotion/nvof_motion.cpp" }
+          if (-not (Test-Path "NvofMotion/CMakeLists.txt")) { throw "missing NvofMotion/CMakeLists.txt" }
+          if (-not $env:CUDA_PATH) { throw "CUDA_PATH not set by cuda-toolkit action" }
+          if (-not (Test-Path "$env:CUDA_PATH/include/cuda.h")) { throw "missing $env:CUDA_PATH/include/cuda.h" }
+
+      - name: Configure (x64)
+        shell: pwsh
+        run: cmake -S NvofMotion -B build -A x64 "-DRESHADE_ROOT=${{ github.workspace }}/reshade-main" "-DNVOF_SDK=${{ github.workspace }}/nvof-sdk/NvOFInterface"
+
+      - name: Build Release
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Configure probe (x64)
+        shell: pwsh
+        run: cmake -S NvofMotion/probe -B build-probe -A x64 "-DNVOF_SDK=${{ github.workspace }}/nvof-sdk/NvOFInterface" "-DCUDAToolkit_ROOT=$env:CUDA_PATH"
+
+      - name: Build probe Release
+        shell: pwsh
+        run: cmake --build build-probe --config Release --parallel
+
+      - name: Collect addon64
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          $dll = Get-ChildItem -Recurse -Filter "nvof_motion.addon64" build | Select-Object -First 1
+          if ($null -eq $dll) {
+            Write-Host "=== build tree ==="
+            Get-ChildItem -Recurse build | Select-Object FullName | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+            throw "nvof_motion.addon64 not found after build"
+          }
+          Copy-Item $dll.FullName "out/nvof_motion.addon64" -Force
+          Get-Item "out/nvof_motion.addon64" | Format-Table Name, Length | Out-String -Width 120 | Write-Host
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvof_motion-addon64
+          path: out/nvof_motion.addon64
+          if-no-files-found: error
+
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvof_probe-win64
+          path: build-probe/Release/nvof_probe.exe
+          if-no-files-found: error
