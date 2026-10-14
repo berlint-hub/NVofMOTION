@@ -54,8 +54,9 @@ NvOFCreateInstanceD3D12_fn p_NvOFCreateInstanceD3D12 = nullptr;
 NV_OF_D3D12_API_FUNCTION_LIST g_of12 = {};
 NvOFHandle g_of_handle = nullptr;
 
-// Production grid (phase 2b target: grid-4 vectors for interpolation).
-constexpr uint32_t kOutGrid = 4;
+// Output grid size: overlay switch 1/2/4 (default 4), persisted, rebuilds session.
+uint32_t g_out_grid = 4;
+uint32_t g_built_grid = 0; // grid the live session was built with
 ID3D12Device *g_owner_device = nullptr; // game device owning the NvOF session
 device *g_api_dev = nullptr;            // for create/destroy of ReShade resources
 bool g_session_active = false;
@@ -457,7 +458,9 @@ bool create_of_nvof_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         NV_OF_INIT_PARAMS init = {};
         init.width = w;
         init.height = h;
-        init.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+        init.outGridSize = g_out_grid <= 1 ? NV_OF_OUTPUT_VECTOR_GRID_SIZE_1
+                               : (g_out_grid == 2 ? NV_OF_OUTPUT_VECTOR_GRID_SIZE_2
+                                                  : NV_OF_OUTPUT_VECTOR_GRID_SIZE_4);
         init.hintGridSize = NV_OF_HINT_VECTOR_GRID_SIZE_UNDEFINED;
         init.mode = NV_OF_MODE_OPTICALFLOW;
         init.perfLevel = NV_OF_PERF_LEVEL_FAST; // production preset
@@ -611,8 +614,8 @@ bool create_of_nvof_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         }
         g_crash_stage = 6;
         {
-            const uint32_t gw = (w + kOutGrid - 1) / kOutGrid;
-            const uint32_t gh = (h + kOutGrid - 1) / kOutGrid;
+            const uint32_t gw = (w + g_out_grid - 1) / g_out_grid;
+            const uint32_t gh = (h + g_out_grid - 1) / g_out_grid;
             D3D12_RESOURCE_DESC td = {};
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             td.Width = gw;
@@ -767,8 +770,8 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
     }
 
     // int16 pairs staging for the device->host download.
-    g_grid_w = (w + kOutGrid - 1) / kOutGrid;
-    g_grid_h = (h + kOutGrid - 1) / kOutGrid;
+    g_grid_w = (w + g_out_grid - 1) / g_out_grid;
+    g_grid_h = (h + g_out_grid - 1) / g_out_grid;
     g_of_cpu.assign(static_cast<size_t>(g_grid_w) * g_grid_h * 2, 0);
     g_gray.assign(static_cast<size_t>(w) * h, 0); // luma staging, session-pitched
     g_gray_pitch = w;
@@ -779,10 +782,11 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-16] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-17] session %ux%u api=0x%X init(grid%u,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
-                 w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
+                 w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_out_grid, g_cap_wmin, g_cap_wmax,
+                 g_cap_hmin,
                  g_cap_hmax, g_cap_grids_count,
                  g_cap_grids_list[0], g_cap_grids_list[1], g_cap_grids_list[2], g_cap_grids_list[3],
                  g_cap_grids_list[4], g_cap_grids_list[5], g_cap_grids_list[6], g_cap_grids_list[7],
@@ -808,7 +812,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-16] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-17] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -904,7 +908,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
         reshade::log::message(reshade::log::level::info, "[NVOF Motion] build: readback ok");
         // R16G16F output texture (ReShade-owned) + CPU upload staging (native).
         {
-            const uint32_t gw = (sw + kOutGrid - 1) / kOutGrid, gh = (sh + kOutGrid - 1) / kOutGrid;
+            const uint32_t gw = (sw + g_out_grid - 1) / g_out_grid, gh = (sh + g_out_grid - 1) / g_out_grid;
             const resource_desc tdesc(gw, gh, 1, 1, format::r16g16_float, 1, memory_heap::default_,
                                       resource_usage::copy_dest | resource_usage::shader_resource);
             resource out_tex = { 0 };
@@ -996,6 +1000,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
 
         g_frame_w = w;
         g_frame_h = h;
+        g_built_grid = g_out_grid;
         ok = true;
     } while (false);
 
@@ -1099,7 +1104,8 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     if (native_queue == nullptr)
         return;
 
-    if (!g_session_active || g_readback == nullptr || w != g_frame_w || h != g_frame_h)
+    if (!g_session_active || g_readback == nullptr || w != g_frame_w || h != g_frame_h ||
+        g_out_grid != g_built_grid)
     {
         // First frame or resize/format change: rebuild pipeline.
         // Drain the GPU only when live objects exist (first build has nothing
@@ -1338,7 +1344,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-16] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-17] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1422,7 +1428,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-16] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-17] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 600th execute (regression signal, not spam).
@@ -1441,7 +1447,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-16] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-17] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1670,7 +1676,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-16] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-17] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1772,7 +1778,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-16]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-17]");
 
     {
         const uint64_t now_ms = GetTickCount64();
@@ -1823,6 +1829,19 @@ static void draw_overlay(effect_runtime *)
     if (ImGui::CollapsingHeader("Session & caps", ImGuiTreeNodeFlags_DefaultOpen))
     {
         ImGui::Text("D3D12 device seen: %s", d3d12_seen ? "yes" : "no");
+        {
+            // Output grid switch 1/2/4 (default 4); rebuilds the session.
+            // 1 = densest/noisiest, 4 = interpolation sweet spot.
+            const char *items[] = { "1 (full)", "2", "4" };
+            int cur = (g_out_grid <= 1) ? 0 : ((g_out_grid == 2) ? 1 : 2);
+            if (ImGui::Combo("Output grid (rebuilds session)", &cur, items, 3))
+            {
+                const uint32_t want = (cur == 0) ? 1u : ((cur == 1) ? 2u : 4u);
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_out_grid = want;
+                reshade::set_config_value(nullptr, "NVOF", "Grid", g_out_grid);
+            }
+        }
         ImGui::Text("NvOF session: %s", session ? "active" : "inactive");
         if (caps_ok)
         {
@@ -1931,6 +1950,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
             unsigned int v = g_show_tex ? 1u : 0u;
             reshade::get_config_value(nullptr, "NVOF", "ShowTex", v);
             g_show_tex = v != 0;
+        }
+        {
+            unsigned int v = g_out_grid;
+            reshade::get_config_value(nullptr, "NVOF", "Grid", v);
+            g_out_grid = (v == 1u || v == 2u || v == 4u) ? v : 4u;
         }
         {
             char tgt[sizeof(g_target_tex)] = {};
