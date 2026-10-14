@@ -30,6 +30,7 @@
 #include <cstring>
 #include <cwchar>
 #include <mutex>
+#include <ppl.h> // MSVC Concurrency Runtime: parallel_for over independent rows
 #include <string>
 #include <vector>
 
@@ -782,7 +783,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-18] session %ux%u api=0x%X init(grid%u,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-19] session %ux%u api=0x%X init(grid%u,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_out_grid, g_cap_wmin, g_cap_wmax,
@@ -812,7 +813,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-18] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-19] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1190,15 +1191,17 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     // Synthetic self-test (overlay toggle): shifting pattern, constant +8px flow.
     // High-contrast 8px checker (FAST-trackable; smooth gradients go blind).
     // Checksum accumulates in the same pass (scene-activity detection).
-    uint64_t sum = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
+    // Additive (order-independent) so rows can run on any thread.
+    uint64_t sum = 0;
+    Concurrency::combinable<uint64_t> gray_sum([]() { return uint64_t(0); });
     if (g_synth_test)
     {
         const int dx = static_cast<int>((8u * static_cast<uint32_t>(g_pair_idx)) % w);
         uint8_t *gd = g_gray.data();
-        for (uint32_t y = 0; y < h; ++y)
-        {
+        Concurrency::parallel_for(0u, h, [&](uint32_t y) {
             uint8_t *drow = gd + static_cast<size_t>(y) * g_gray_pitch;
             const int gy = (static_cast<int>(y) * 255) / static_cast<int>(h);
+            uint64_t local = 0;
             for (uint32_t x = 0; x < w; ++x)
             {
                 const int sx = (static_cast<int>(x) + static_cast<int>(w) - dx) % static_cast<int>(w);
@@ -1209,10 +1212,10 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 if (t > 255)
                     t = 255;
                 drow[x] = static_cast<uint8_t>(t);
-                sum ^= drow[x];
-                sum *= 1099511628211ULL;
+                local += drow[x];
             }
-        }
+            gray_sum.local() += local;
+        });
     }
     else if (g_gray_pitch == 0 || g_gray.size() < static_cast<size_t>(g_gray_pitch) * h)
     {
@@ -1223,20 +1226,22 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     {
         uint8_t *gd = g_gray.data();
         const uint8_t *rb = static_cast<const uint8_t *>(g_readback_ptr);
-        for (uint32_t y = 0; y < h; ++y)
-        {
-            uint8_t *drow = gd + static_cast<size_t>(y) * g_gray_pitch;
-            const uint8_t *srow = rb + static_cast<size_t>(y) * g_readback_pitch;
+        const uint32_t rp = g_readback_pitch, gp = g_gray_pitch;
+        Concurrency::parallel_for(0u, h, [&](uint32_t y) {
+            uint8_t *drow = gd + static_cast<size_t>(y) * gp;
+            const uint8_t *srow = rb + static_cast<size_t>(y) * rp;
+            uint64_t local = 0;
             for (uint32_t x = 0; x < w; ++x)
             {
                 drow[x] = static_cast<uint8_t>((77u * srow[4 * x] + 150u * srow[4 * x + 1] +
                                                 29u * srow[4 * x + 2]) >>
                                                8);
-                sum ^= drow[x];
-                sum *= 1099511628211ULL;
+                local += drow[x];
             }
-        }
+            gray_sum.local() += local;
+        });
     }
+    sum = gray_sum.combine([](uint64_t a, uint64_t b) { return a + b; });
     const int fill_idx = static_cast<int>(g_pair_idx % 2);
     // Upload: gray rows -> mapped UPLOAD staging -> registered R8 input (own list).
     {
@@ -1344,7 +1349,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-18] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-19] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1428,7 +1433,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-18] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-19] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 600th execute (regression signal, not spam).
@@ -1447,7 +1452,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-18] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-19] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1470,39 +1475,60 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
     {
         const auto t_cv0 = std::chrono::steady_clock::now();
         const size_t total = static_cast<size_t>(g_grid_w) * g_grid_h;
-        double acc = 0.0;
-        size_t moving = 0, invalid = 0, nsamp = 0;
-        for (size_t i = 0; i < total; ++i)
+        struct StatPart
         {
-            // S10.5 hardware units -> px (g_flow_scale, default 1/32).
-            // Exact INT16_MIN in either lane = driver "no match" sentinel.
-            const int16_t rx = g_of_cpu[i * 2], ry = g_of_cpu[i * 2 + 1];
-            const bool bad = (rx == INT16_MIN || ry == INT16_MIN);
-            const float fx = bad ? 0.0f : static_cast<float>(rx) * g_flow_scale;
-            const float fy = bad ? 0.0f : static_cast<float>(ry) * g_flow_scale;
-            const size_t row = i / g_grid_w, col = i % g_grid_w;
-            uint16_t *px = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(g_upload_ptr) +
-                                                        row * g_up_pitch + col * 4);
-            px[0] = float_to_half(fx);
-            px[1] = float_to_half(fy);
-            if (bad)
-            {
-                ++invalid;
-                continue;
-            }
-            // Stats on a 1/16 subsample (every 4th row/col): sqrt is the
-            // hottest op here (5M/frame at grid1), texture stays full-res.
-            if (((row | col) & 3u) != 0)
-                continue;
-            ++nsamp;
-            const double len = sqrt(static_cast<double>(fx) * fx + static_cast<double>(fy) * fy);
-            acc += len;
-            if (len > 0.5)
-                ++moving;
+            double acc = 0.0;
+            size_t moving = 0, invalid = 0, nsamp = 0;
+        };
+        Concurrency::combinable<StatPart> parts;
+        {
+            uint8_t *up = static_cast<uint8_t *>(g_upload_ptr);
+            const uint32_t upp = g_up_pitch, gw = g_grid_w, gh = g_grid_h;
+            const int16_t *vec = g_of_cpu.data();
+            const float sc = g_flow_scale;
+            Concurrency::parallel_for(0u, gh, [&](uint32_t row) {
+                StatPart &p = parts.local();
+                uint16_t *pxrow =
+                    reinterpret_cast<uint16_t *>(up + static_cast<size_t>(row) * upp);
+                for (uint32_t col = 0; col < gw; ++col)
+                {
+                    const size_t i = static_cast<size_t>(row) * gw + col;
+                    // S10.5 hardware units -> px (exact INT16_MIN = "no match").
+                    const int16_t rx = vec[i * 2], ry = vec[i * 2 + 1];
+                    const bool bad = (rx == INT16_MIN || ry == INT16_MIN);
+                    const float fx = bad ? 0.0f : static_cast<float>(rx) * sc;
+                    const float fy = bad ? 0.0f : static_cast<float>(ry) * sc;
+                    pxrow[col * 2] = float_to_half(fx);
+                    pxrow[col * 2 + 1] = float_to_half(fy);
+                    if (bad)
+                    {
+                        ++p.invalid;
+                        continue;
+                    }
+                    // Stats on a 1/16 subsample (sqrt is hot), texture full-res.
+                    if (((row | col) & 3u) != 0)
+                        continue;
+                    ++p.nsamp;
+                    const double len = sqrt(static_cast<double>(fx) * fx + static_cast<double>(fy) * fy);
+                    p.acc += len;
+                    if (len > 0.5)
+                        ++p.moving;
+                }
+            });
         }
-        g_flow_avg = static_cast<float>(acc / (nsamp != 0 ? nsamp : 1));
-        g_flow_moving_pct = 100.0f * static_cast<float>(moving) / static_cast<float>(nsamp != 0 ? nsamp : 1);
-        g_flow_invalid_pct = 100.0f * static_cast<float>(invalid) / static_cast<float>(total != 0 ? total : 1);
+        const StatPart tot = parts.combine([](const StatPart &a, const StatPart &b) {
+            StatPart r;
+            r.acc = a.acc + b.acc;
+            r.moving = a.moving + b.moving;
+            r.invalid = a.invalid + b.invalid;
+            r.nsamp = a.nsamp + b.nsamp;
+            return r;
+        });
+        g_flow_avg = static_cast<float>(tot.acc / (tot.nsamp != 0 ? tot.nsamp : 1));
+        g_flow_moving_pct =
+            100.0f * static_cast<float>(tot.moving) / static_cast<float>(tot.nsamp != 0 ? tot.nsamp : 1);
+        g_flow_invalid_pct =
+            100.0f * static_cast<float>(tot.invalid) / static_cast<float>(total != 0 ? total : 1);
 
         if (SUCCEEDED(g_cmd_alloc->Reset()) && SUCCEEDED(g_cmd_list->Reset(g_cmd_alloc, nullptr)))
         {
@@ -1617,26 +1643,27 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                             {
                                 // Nearest-neighbor resample grid -> target dims (invalid -> 0).
                                 const uint32_t tpitch = g_target_foot.Footprint.RowPitch;
-                                for (uint32_t ty = 0; ty < dbg_th; ++ty)
-                                {
-                                    uint16_t *drow = reinterpret_cast<uint16_t *>(
-                                        static_cast<uint8_t *>(g_target_up_ptr) +
-                                        static_cast<size_t>(ty) * tpitch);
+                                uint8_t *tbase = static_cast<uint8_t *>(g_target_up_ptr);
+                                const int16_t *tvec = g_of_cpu.data();
+                                const uint32_t tgw = g_grid_w, tgh = g_grid_h, ttw = dbg_tw, tth = dbg_th;
+                                const float tsc = g_flow_scale;
+                                Concurrency::parallel_for(0u, tth, [&](uint32_t ty) {
+                                    uint16_t *drow = reinterpret_cast<uint16_t *>(tbase + static_cast<size_t>(ty) * tpitch);
                                     const uint32_t gy =
-                                        static_cast<uint32_t>((static_cast<uint64_t>(ty) * g_grid_h) / dbg_th);
-                                    for (uint32_t tx = 0; tx < dbg_tw; ++tx)
+                                        static_cast<uint32_t>((static_cast<uint64_t>(ty) * tgh) / tth);
+                                    for (uint32_t tx = 0; tx < ttw; ++tx)
                                     {
                                         const uint32_t gx =
-                                            static_cast<uint32_t>((static_cast<uint64_t>(tx) * g_grid_w) / dbg_tw);
-                                        const int16_t rx = g_of_cpu[(gy * g_grid_w + gx) * 2];
-                                        const int16_t ry = g_of_cpu[(gy * g_grid_w + gx) * 2 + 1];
+                                            static_cast<uint32_t>((static_cast<uint64_t>(tx) * tgw) / ttw);
+                                        const int16_t rx = tvec[(gy * tgw + gx) * 2];
+                                        const int16_t ry = tvec[(gy * tgw + gx) * 2 + 1];
                                         const bool bad = (rx == INT16_MIN || ry == INT16_MIN);
                                         drow[tx * 2] =
-                                            float_to_half(bad ? 0.0f : static_cast<float>(rx) * g_flow_scale);
+                                            float_to_half(bad ? 0.0f : static_cast<float>(rx) * tsc);
                                         drow[tx * 2 + 1] =
-                                            float_to_half(bad ? 0.0f : static_cast<float>(ry) * g_flow_scale);
+                                            float_to_half(bad ? 0.0f : static_cast<float>(ry) * tsc);
                                     }
-                                }
+                                });
                                 ID3D12Resource *t = reinterpret_cast<ID3D12Resource *>(tres.handle);
                             D3D12_RESOURCE_BARRIER to_copy3 = {};
                             to_copy3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1680,7 +1707,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-18] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "[d3d12-19] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
                              "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
@@ -1782,7 +1809,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-18]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-19]");
 
     {
         const uint64_t now_ms = GetTickCount64();
