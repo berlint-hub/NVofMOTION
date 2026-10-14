@@ -2,15 +2,16 @@
 // Shows the flow field the addon injects into the effect texture
 // "motion_vectors_tex" (R16G16F, grid dims, px units, +x right, +y down).
 // Set the addon's "Target texture" field to exactly: motion_vectors_tex
-// (dims must match the current grid: 860x360 @3440x1440, 430x324 @1718x1294,
-// else the addon skips the copy and reports mismatch).
+// Dims track the backbuffer ((W+3)/4 = addon grid for any resolution);
+// if the addon reports mismatch, the session grid changed (resize) -
+// just Reload effects.
 // Copy this file next to your other ReShade .fx files and enable it.
 // No #includes needed (self-contained).
 
 texture motion_vectors_tex
 {
-    Width = 860;
-    Height = 360;
+    Width = (BUFFER_WIDTH + 3) / 4;
+    Height = (BUFFER_HEIGHT + 3) / 4;
     Format = RG16F;
 };
 sampler NVOFMotionSampler

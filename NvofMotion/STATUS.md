@@ -178,6 +178,10 @@ buffer – impossible on PCSX2, PS2-era games have none).
   native, grid4/FAST) -> R16G16F field -> effect texture -> shader.
   INT16_MIN invalids filtered, telemetry + self-test + in-menu view stay
   as regression tools.
+- Windowed mode black: debug `.fx` had hardcoded 860x360 (fullscreen
+  grid4) but windowed grid is 430x324 – addon correctly skipped the copy
+  (dims guard). Fixed with dynamic dims `(BUFFER_WIDTH+3)/4` (same ceil
+  formula as the addon grid, matches any resolution).
 - NEXT: perf timings per stage in overlay (user asked about GPU cost),
   `paths-ignore` for `*.md`, consumer shaders (frame-gen feed).
 - `[d3d12-10]` in-menu view WORKS: live flow field visible (red/green
