@@ -7,8 +7,8 @@ just drop `nvof_motion.addon64` next to `ReShade.dll`.
 
 - **Add-on + probe sources:** [`NvofMotion/`](NvofMotion/) (see its
   [README](NvofMotion/README.md), [STATUS](NvofMotion/STATUS.md),
-  [build guide](NvofMotion/BUILD.md), MIT
-  [LICENSE](NvofMotion/LICENSE))
+  [build guide](NvofMotion/BUILD.md))
+- **License:** MIT ([LICENSE](LICENSE))
 - **CI:** [`.github/workflows/build-nvof.yml`](.github/workflows/build-nvof.yml)
   builds `nvof_motion.addon64` + `nvof_probe.exe` on `windows-2022`.
 - **History:** full `nvof-motion` bisect history lives in branch
