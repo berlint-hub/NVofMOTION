@@ -218,6 +218,10 @@ buffer – impossible on PCSX2, PS2-era games have none).
   half-zero first pair after resize), fused gray+checksum pass, vec
   telemetry 1/600, dead PTX build removed (addon is pure C++ now),
   `paths-ignore: **.md` in CI.
+- `[d3d12-15]` verified in the wild: inject `found=1 injected=1` incl.
+  cross-size resample (400x206 grid -> 860x360 target), no timeouts,
+  temporal ON healthy. Target name is FREE (any R16G16F texture_2d) –
+  the field IS the rename feature, not a fixed contract.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)
