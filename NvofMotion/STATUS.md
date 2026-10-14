@@ -48,7 +48,7 @@ buffer – impossible on PCSX2, PS2-era games have none).
 - Pushing 55KB files by hand risks dropped lines – always byte-verify the
   pushed file against staging + let CI compile. `build_pipeline_locked`
   takes 4 params (`device *dev` first). Overlay build tags (`[roi1]`,
-  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-13]`) prove which binary ran – keep tagging test builds.
+  `[streams]`, `[dali0]`-`[dali19]`, `[d3d12-1]`-`[d3d12-14]`) prove which binary ran – keep tagging test builds.
 
 ## CURRENT STATE: OF5 bisection (nvOFExecute = INVALID_PARAM, executes 0)
 
@@ -205,6 +205,13 @@ buffer – impossible on PCSX2, PS2-era games have none).
   addon `find_texture_variable` + copy, dims must match grid). Set addon
   Target texture to exactly `motion_vectors_tex`. Semantic-binding path
   parked (loader needs file unless semantic resolves – unverified).
+- `[d3d12-13]` QoL batch: STALL watchdog (>2s red warning), per-stage ms
+  timings (`Times ms: cap/up/exec/down/conv`), 2MB log rotation, session
+  grid row, persisted SynthTest/ShowTex, collapsible overlay sections.
+- Windowed black, robust fix: fixed fx dims only match fullscreen grid.
+- Current test build `[d3d12-14]` = resolution-independent injection:
+  nearest-neighbor resample grid -> ANY R16G16 target dims (own staging,
+  realloc on change, invalid->0). No Reload needed after resize.
 - Overlay `out grids mask 0x1` legend is misleading (grid 4 provably works).
 
 ## Open follow-ups (not blockers)

@@ -171,6 +171,11 @@ ID3D12Resource *g_upload = nullptr;
 void *g_upload_ptr = nullptr;
 uint32_t g_up_pitch = 0;
 D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_up_footprint = {};
+// Target-sized UPLOAD staging for resolution-independent injection resample.
+ID3D12Resource *g_target_up = nullptr;
+void *g_target_up_ptr = nullptr;
+D3D12_PLACED_SUBRESOURCE_FOOTPRINT g_target_foot = {};
+uint32_t g_target_up_w = 0, g_target_up_h = 0;
 bool g_out_ready = false; // texture left in SHADER_RESOURCE (skip entry barrier)
 float g_flow_scale = 1.0f / 32.0f; // S10.5 -> px (tunable, overlay + ini)
 char g_target_tex[128] = "motion_vectors_tex"; // injection target (empty = off)
@@ -366,6 +371,14 @@ void teardown_pipeline_locked(bool gpu_idle)
         g_upload = nullptr;
     }
     g_upload_ptr = nullptr;
+    if (g_target_up != nullptr)
+    {
+        g_target_up->Unmap(0, nullptr);
+        g_target_up->Release();
+        g_target_up = nullptr;
+    }
+    g_target_up_ptr = nullptr;
+    g_target_up_w = g_target_up_h = 0;
     if (gpu_idle && g_api_dev != nullptr)
     {
         if (g_out_srv.handle != 0)
@@ -760,7 +773,7 @@ bool create_of_locked(ID3D12Device *d3d12, uint32_t w, uint32_t h)
         reshade::log::message(reshade::log::level::info, msg.c_str());
         char buf[768] = {};
         snprintf(buf, sizeof(buf),
-                 "[d3d12-13] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
+                 "[d3d12-14] session %ux%u api=0x%X init(grid4,hintUndef,noExt,noCost,FAST,OF,inR8,tempON) caps %u-%u x %u-%u "
                  "grids[%u]{%u %u %u %u %u %u %u %u} roi %u | "
                  "in0=%p in1=%p | out=%p outgrid=%ux%u",
                  w, h, static_cast<unsigned int>(NV_OF_API_VERSION), g_cap_wmin, g_cap_wmax, g_cap_hmin,
@@ -788,7 +801,7 @@ bool build_pipeline_locked(device *dev, ID3D12Device *d3d12, uint32_t w, uint32_
     const uint32_t sh = h;
     {
         char buf[128] = {};
-        snprintf(buf, sizeof(buf), "[d3d12-13] build req %ux%u -> session %ux%u", w, h, sw, sh);
+        snprintf(buf, sizeof(buf), "[d3d12-14] build req %ux%u -> session %ux%u", w, h, sw, sh);
         dbglog(buf);
     }
     bool ok = false;
@@ -1320,7 +1333,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 g_dbg_fail_lines++;
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-13] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
+                         "[d3d12-14] exec FAIL #%d: OF %d detail='%s' inHandle=%p refHandle=%p outHandle=%p "
                          "frames=%llu",
                          g_dbg_fail_lines, static_cast<int>(ost), g_last_of_error.c_str(),
                          in12.inputFrame, in12.referenceFrame, out12.outputBuffer,
@@ -1400,7 +1413,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
             if (g_executes == 1)
             {
                 char buf[256] = {};
-                snprintf(buf, sizeof(buf), "[d3d12-13] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
+                snprintf(buf, sizeof(buf), "[d3d12-14] first execute OK: grid %ux%u", g_grid_w, g_grid_h);
                 dbglog(buf);
             }
             // Vector telemetry every 60th execute: frozen vs live data?
@@ -1419,7 +1432,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                 }
                 char buf[512] = {};
                 snprintf(buf, sizeof(buf),
-                         "[d3d12-13] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
+                         "[d3d12-14] vec%llu: avg=%.1f c0=(%d,%d) cc=(%.1f,%.1f) c1=(%.1f,%.1f) dlhash=%llx "
                          "graysum=%llx",
                          static_cast<unsigned long long>(g_executes), g_flow_avg, g_of_cpu[0], g_of_cpu[1],
                          g_of_cpu[ci] / 32.0f, g_of_cpu[ci + 1] / 32.0f,
@@ -1518,11 +1531,93 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                         dbg_fmt = static_cast<int>(tdesc.texture.format);
                         dbg_tw = tdesc.texture.width;
                         dbg_th = tdesc.texture.height;
+                        // Any R16G16 target size works: resample grid -> target dims.
                         if (tdesc.type == resource_type::texture_2d &&
-                            tdesc.texture.format == format::r16g16_float &&
-                            tdesc.texture.width == g_grid_w && tdesc.texture.height == g_grid_h)
+                            tdesc.texture.format == format::r16g16_float && dbg_tw > 0 && dbg_th > 0)
                         {
-                            ID3D12Resource *t = reinterpret_cast<ID3D12Resource *>(tres.handle);
+                            // (Re)allocate target-sized UPLOAD staging on dims change.
+                            if (g_target_up == nullptr || dbg_tw != g_target_up_w || dbg_th != g_target_up_h)
+                            {
+                                if (g_target_up != nullptr)
+                                {
+                                    g_target_up->Unmap(0, nullptr);
+                                    g_target_up->Release();
+                                    g_target_up = nullptr;
+                                }
+                                g_target_up_ptr = nullptr;
+                                g_target_up_w = g_target_up_h = 0;
+                                D3D12_RESOURCE_DESC ttd = {};
+                                ttd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                                ttd.Width = dbg_tw;
+                                ttd.Height = dbg_th;
+                                ttd.DepthOrArraySize = 1;
+                                ttd.MipLevels = 1;
+                                ttd.Format = DXGI_FORMAT_R16G16_FLOAT;
+                                ttd.SampleDesc.Count = 1;
+                                ttd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                                D3D12_PLACED_SUBRESOURCE_FOOTPRINT tfp = {};
+                                UINT64 ttotal = 0;
+                                d3d12->GetCopyableFootprints(&ttd, 0, 1, 0, &tfp, nullptr, nullptr, &ttotal);
+                                if (ttotal != 0 && tfp.Footprint.RowPitch != 0)
+                                {
+                                    D3D12_RESOURCE_DESC tbd = {};
+                                    tbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                                    tbd.Width = ttotal;
+                                    tbd.Height = 1;
+                                    tbd.DepthOrArraySize = 1;
+                                    tbd.MipLevels = 1;
+                                    tbd.Format = DXGI_FORMAT_UNKNOWN;
+                                    tbd.SampleDesc.Count = 1;
+                                    tbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                                    D3D12_HEAP_PROPERTIES tuhp = {};
+                                    tuhp.Type = D3D12_HEAP_TYPE_UPLOAD;
+                                    tuhp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+                                    tuhp.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+                                    void *tmapped = nullptr;
+                                    ID3D12Resource *tup = nullptr;
+                                    if (SUCCEEDED(d3d12->CreateCommittedResource(
+                                            &tuhp, D3D12_HEAP_FLAG_NONE, &tbd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                            nullptr, IID_PPV_ARGS(&tup))) &&
+                                        tup != nullptr && SUCCEEDED(tup->Map(0, nullptr, &tmapped)) &&
+                                        tmapped != nullptr)
+                                    {
+                                        g_target_up = tup;
+                                        g_target_up_ptr = tmapped;
+                                        g_target_foot = tfp;
+                                        g_target_up_w = dbg_tw;
+                                        g_target_up_h = dbg_th;
+                                    }
+                                    else if (tup != nullptr)
+                                    {
+                                        tup->Release();
+                                    }
+                                }
+                            }
+                            if (g_target_up != nullptr && g_target_up_ptr != nullptr)
+                            {
+                                // Nearest-neighbor resample grid -> target dims (invalid -> 0).
+                                const uint32_t tpitch = g_target_foot.Footprint.RowPitch;
+                                for (uint32_t ty = 0; ty < dbg_th; ++ty)
+                                {
+                                    uint16_t *drow = reinterpret_cast<uint16_t *>(
+                                        static_cast<uint8_t *>(g_target_up_ptr) +
+                                        static_cast<size_t>(ty) * tpitch);
+                                    const uint32_t gy =
+                                        static_cast<uint32_t>((static_cast<uint64_t>(ty) * g_grid_h) / dbg_th);
+                                    for (uint32_t tx = 0; tx < dbg_tw; ++tx)
+                                    {
+                                        const uint32_t gx =
+                                            static_cast<uint32_t>((static_cast<uint64_t>(tx) * g_grid_w) / dbg_tw);
+                                        const int16_t rx = g_of_cpu[(gy * g_grid_w + gx) * 2];
+                                        const int16_t ry = g_of_cpu[(gy * g_grid_w + gx) * 2 + 1];
+                                        const bool bad = (rx == INT16_MIN || ry == INT16_MIN);
+                                        drow[tx * 2] =
+                                            float_to_half(bad ? 0.0f : static_cast<float>(rx) * g_flow_scale);
+                                        drow[tx * 2 + 1] =
+                                            float_to_half(bad ? 0.0f : static_cast<float>(ry) * g_flow_scale);
+                                    }
+                                }
+                                ID3D12Resource *t = reinterpret_cast<ID3D12Resource *>(tres.handle);
                             D3D12_RESOURCE_BARRIER to_copy3 = {};
                             to_copy3.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                             to_copy3.Transition.pResource = t;
@@ -1535,9 +1630,9 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                             tg_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                             tg_dst.SubresourceIndex = 0;
                             D3D12_TEXTURE_COPY_LOCATION tg_src = {};
-                            tg_src.pResource = g_upload;
+                            tg_src.pResource = g_target_up;
                             tg_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                            tg_src.PlacedFootprint = g_up_footprint;
+                            tg_src.PlacedFootprint = g_target_foot;
                             g_cmd_list->CopyTextureRegion(&tg_dst, 0, 0, 0, &tg_src, nullptr);
                             D3D12_RESOURCE_BARRIER to_sr = {};
                             to_sr.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1547,6 +1642,7 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                             to_sr.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
                             g_cmd_list->ResourceBarrier(1, &to_sr);
                             injected = true;
+                            } // end target-staging copy
                         }
                     }
                 }
@@ -1564,13 +1660,12 @@ static void on_begin_effects(effect_runtime *runtime, command_list *, resource_v
                     last_state = state;
                     char buf[512] = {};
                     snprintf(buf, sizeof(buf),
-                             "[d3d12-13] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
-                             "type=%d fmt=%d %ux%u (want r16g16_float %ux%u)",
+                             "[d3d12-14] inject '%s': found=%d injected=%d var=%llx srv=%llx res=%llx "
+                             "type=%d fmt=%d %ux%u (want r16g16_float, resampled)",
                              g_target_tex, found ? 1 : 0, injected ? 1 : 0,
                              static_cast<unsigned long long>(dbg_var),
                              static_cast<unsigned long long>(dbg_srv),
-                             static_cast<unsigned long long>(dbg_res), dbg_type, dbg_fmt, dbg_tw, dbg_th,
-                             g_grid_w, g_grid_h);
+                             static_cast<unsigned long long>(dbg_res), dbg_type, dbg_fmt, dbg_tw, dbg_th);
                     dbglog(buf);
                 }
             }
@@ -1667,7 +1762,7 @@ static void draw_overlay(effect_runtime *)
 #endif
     }
 
-    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-13]");
+    ImGui::TextUnformatted("NVOF Motion (phase 2b: vectors) [d3d12-14]");
 
     {
         const uint64_t now_ms = GetTickCount64();
